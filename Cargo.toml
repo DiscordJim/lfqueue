@@ -1,0 +1,9 @@
+[package]
+name = "lfqueue"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+crossbeam-utils = "0.8.21"
+lockfree = "0.5.1"
+owned-alloc = "0.2.0"

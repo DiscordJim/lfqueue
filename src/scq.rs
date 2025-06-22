@@ -8,6 +8,7 @@
 use std::cell::UnsafeCell;
 use std::cmp;
 use std::marker::PhantomData;
+use std::ops::ControlFlow;
 use std::ptr::{NonNull, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicPtr, AtomicUsize};
 
@@ -15,8 +16,7 @@ use std::sync::atomic::Ordering::*;
 
 use crossbeam_utils::CachePadded;
 use lockfree::incin::{Incinerator, Pause};
-use lockfree::removable::Removable;
-use owned_alloc::{OwnedAlloc, RawVec};
+use owned_alloc::OwnedAlloc;
 
 #[derive(Debug)]
 struct ScqRing {
@@ -26,8 +26,6 @@ struct ScqRing {
     array: Box<[CachePadded<AtomicUsize>]>,
     order: usize,
 }
-
-
 
 const NON_YIELDING_CYCLES: usize = 20;
 const YIELDING_CYCLES: usize = 10_000;
@@ -80,27 +78,21 @@ fn allocate_atomic_array_full(order: usize) -> ScqAlloc {
     let half = lfring_pow2(order);
     let n = half * 2;
 
-
-    // Initialize an array of 
+    // Initialize an array of
     let mut vector = Vec::with_capacity(n);
     vector.reserve_exact(n);
     for _ in 0..n {
         vector.push(CachePadded::new(AtomicUsize::new(-1isize as usize)));
     }
 
-
-
     // let array = (0..n)
     //     .map(|_| AtomicUsize::new((-1isize) as usize))
     //     .map(CachePadded::new)
     //     .collect::<Vec<_>>()
     //     .into_boxed_slice();
-    
 
     let mut i = 0;
     while i != n {
-        
-
         vector[lfring_map(i, order, n)].store(n + lfring_raw_map(i, order, n), Relaxed);
         i += 1;
     }
@@ -110,11 +102,10 @@ fn allocate_atomic_array_full(order: usize) -> ScqAlloc {
     //     i += 1;
     // }
 
-
     ScqAlloc {
         array: vector.into_boxed_slice(),
         tail: lfring_threshold3(half, n),
-        thresh: half as isize
+        thresh: half as isize,
     }
 }
 
@@ -228,7 +219,6 @@ impl ScqRing {
             return None;
         }
 
-        
         let mut entry_new = 0;
         let mut tail = 0;
         loop {
@@ -262,7 +252,7 @@ impl ScqRing {
                         entry_new = hcycle ^ ((!entry) & n);
                     }
 
-                    if !( lfring_signed_cmp(ecycle, hcycle).is_lt()
+                    if !(lfring_signed_cmp(ecycle, hcycle).is_lt()
                         && self.array[hidx]
                             .compare_exchange_weak(entry, entry_new, AcqRel, Acquire)
                             .is_err())
@@ -298,13 +288,6 @@ pub enum ScqError {
     QueueFull,
 }
 
-// const LF_CACHE_SHIFT: usize = 7;
-// const CACHE_SHIFT_BYTES: usize = 1usize << LF_CACHE_SHIFT;
-// const LFRING_MIN: usize = LF_CACHE_SHIFT - 2;
-
-// fn map(idx: usize, order: usize, n: usize) -> usize {
-//     idx & (n - 1)
-// }
 #[derive(Debug)]
 pub struct ScqQueue<T> {
     backing: UnsafeCell<Box<[Option<T>]>>,
@@ -340,13 +323,13 @@ impl<T> ScqQueue<T> {
         }
     }
     pub fn enqueue(&self, item: T) -> Result<(), ScqError> {
-        // let value = OwnedAlloc::new(item);
-        // let ptr = value.into_raw().as_ptr();
-
+        self.enqueue_cycle(item).map_err(|(_, b)| b)
+    }
+    fn enqueue_cycle(&self, item: T) -> Result<(), (T, ScqError)> {
         // let current = self.used.fetch_add(1, Acquire);
         if self.free_queue.capacity() <= self.used.fetch_add(1, AcqRel) {
             self.used.fetch_sub(1, AcqRel);
-            return Err(ScqError::QueueFull);
+            return Err((item, ScqError::QueueFull));
         }
 
         // self.used.fetch_add(1, Acquire);
@@ -359,15 +342,13 @@ impl<T> ScqQueue<T> {
         *slot = Some(item);
         // unsafe { *slot.get() = Some(item) };
 
-        self.alloc_queue.enqueue(pos)?;
+        if let Err(error) = self.alloc_queue.enqueue(pos) {
+            return Err((slot.take().unwrap(), error));
+        }
 
-      
+        // self.alloc_queue.enqueue(pos)?;
+
         Ok(())
-
-        // let slot = self.free_queue.dequeue();
-        // println!("Slot: {:?}", slot);
-        // println!("ENQUEING PTR: {:?}", ptr);
-        // self.proper.enqueue(ptr as usize);
     }
     pub fn dequeue(&self) -> Option<T> {
         let pos = self.alloc_queue.dequeue()?;
@@ -416,10 +397,8 @@ pub struct LcsqQueue<T> {
     head: CachePadded<AtomicPtr<LscqNode<T>>>,
     tail: CachePadded<AtomicPtr<LscqNode<T>>>,
     internal_order: usize,
-    incin: Incinerator<OwnedAlloc<LscqNode<T>>>
+    incin: UnboundedQueueIncinerator<T>,
 }
-
-
 
 /// Stores the actual [ScqQueue] along with a pointer
 /// to the next node within the queue. This gives us an
@@ -432,20 +411,23 @@ struct LscqNode<T> {
 }
 
 impl<T> LscqNode<T> {
+    /// Allocates a new [LscqNode] object with an order. This
+    /// will create a queue with a size of 2 ^ (order + 1).
     pub fn allocate(order: usize) -> OwnedAlloc<Self> {
-
-      
-
-
         OwnedAlloc::new(Self {
             is_live: AtomicBool::new(true),
             next: AtomicPtr::default(),
-            value: ScqQueue::new(order)
+            value: ScqQueue::new(order),
         })
     }
-    
 }
 
+/// Bypasses the null check for the creation of a [NonNull]. There
+/// is still a check in debug mode so that tests may catch a `null`
+/// value and fail as intended.
+///
+/// # Safety
+/// To call this method safely, `ptr` must be a non-null pointer.
 #[inline(always)]
 unsafe fn bypass_null<T>(ptr: *mut T) -> NonNull<T> {
     debug_assert!(!ptr.is_null());
@@ -454,24 +436,19 @@ unsafe fn bypass_null<T>(ptr: *mut T) -> NonNull<T> {
     unsafe { NonNull::new_unchecked(ptr) }
 }
 
-
+/// Checks the null alignment.
 /// https://gitlab.com/bzim/lockfree/-/blob/master/src/ptr.rs?ref_type=heads
 #[inline(always)]
 pub fn check_null_align<T>() {
     debug_assert!(null_mut::<T>() as usize % align_of::<T>() == 0);
 }
 
-
-
-
-
-impl<T: Clone> LcsqQueue<T> {
+impl<T> LcsqQueue<T> {
     /// Creates a new [LcsqQueue] with a single internal ring.
     pub fn new(segment_order: usize) -> Self {
         let queue = LscqNode::allocate(segment_order);
 
         let queue_ptr = queue.into_raw().as_ptr();
-
 
         // Check the null alignment of the `LscqNode`.
         check_null_align::<LscqNode<T>>();
@@ -479,36 +456,46 @@ impl<T: Clone> LcsqQueue<T> {
             head: AtomicPtr::new(queue_ptr).into(),
             tail: AtomicPtr::new(queue_ptr).into(),
             internal_order: segment_order,
-            incin: Incinerator::new()
+            incin: Incinerator::new(),
         }
     }
-    pub fn enqueue(&self, element: T) {
+    /// Enqueues an element of type `T` into the queue.
+    pub fn enqueue(&self, mut element: T) {
         loop {
             let cq_ptr = self.tail.load(Acquire);
-            println!("CQ: {:?}", cq_ptr);
-            if unsafe { !(&*cq_ptr).next.load(Acquire).is_null() } {
-                let _ = self.tail.compare_exchange(
-                    cq_ptr,
-                    unsafe { (*cq_ptr).next.load(Acquire) },
-                    AcqRel,
-                    Acquire,
-                );
+            // SAFETY: The tail can never be a null pointer so we can
+            // safely dereference. Additionally, there are never any mutabkle
+            // pointers to this memory address.
+            let cq = unsafe { &*cq_ptr };
+
+            // If the next pointer is not null then we want to keep
+            // going next until we have found the end.
+            if !cq.next.load(Acquire).is_null() {
+                let _ = self
+                    .tail
+                    .compare_exchange(cq_ptr, cq.next.load(Acquire), AcqRel, Acquire);
+
                 continue;
             }
 
-            let cq = unsafe { &*cq_ptr };
-
-            if cq.value.enqueue(element.clone()).is_ok() {
-                return;
+            // Attempts to enqueue the item.
+            match cq.value.enqueue_cycle(element) {
+                Ok(_) => {
+                    // We are done and have succesfully enqueued the item.
+                    return;
+                }
+                Err((elem, _)) => {
+                    // We do not care that we failed here.
+                    element = elem;
+                }
             }
 
+            // Allocate a new queue.
             let ncq = LscqNode::allocate(self.internal_order);
-
-            ncq.value.enqueue(element.clone()).unwrap();
-
+            ncq.value.enqueue(element).unwrap();
             let ncq = ncq.into_raw().as_ptr();
-            println!("Making new queue");
 
+            // Try to insert a new tail into the queue.
             if cq
                 .next
                 .compare_exchange(null_mut(), ncq, AcqRel, Acquire)
@@ -517,17 +504,27 @@ impl<T: Clone> LcsqQueue<T> {
                 self.tail
                     .compare_exchange(cq_ptr, ncq, AcqRel, Acquire)
                     .unwrap();
+                // NOTE: We do not have to free the allocation here
+                // because we haave succesfully put it into the list.
                 return;
             }
 
-            // SAFETY: We just allocated this with an `OwnedAlloc` object,
-            // and the ptr is certainly not null, so we ma free it here.
-            unsafe { free_owned_alloc(ncq) };
+            // Extract the first element so the borrow checker is happy and we
+            // can avoid clones.
+            // SAFETY: This is the only instance of this pointer
+            // and it is non-null because we allocated it with `OwnedAlloc`.
+            element = unsafe { (&mut *ncq).value.dequeue().unwrap() };
+
+            // SAFETY: The allocation was created with `OwnedAlloc` and we
+            // have unique access to it.
+            unsafe {
+                free_owned_alloc(ncq);
+            }
         }
     }
     pub fn dequeue(&self) -> Option<T> {
         let pause = self.incin.pause();
-    
+
         loop {
             let cq_ptr = unsafe { bypass_null(self.head.load(Acquire)) };
             let cq = unsafe { &*cq_ptr.as_ptr() };
@@ -547,36 +544,41 @@ impl<T: Clone> LcsqQueue<T> {
                 return p;
             }
 
-
-
             // Here we remove the SCQ.
-            let mut front_ptr = cq_ptr;
-            loop {
+            unsafe { self.free_front(cq_ptr, &pause) }?;
+        }
+    }
 
-                if unsafe { cq_ptr.as_ref().is_live.swap(false, AcqRel) } {
-                    unsafe { self.try_clear_first(front_ptr, &pause) };
-                    break;
-                } else {
-                    // It is already dead.
-                    front_ptr = unsafe { self.try_clear_first(front_ptr, &pause) }?;
-                }
-
+    /// Clear the front
+    #[inline(always)]
+    unsafe fn free_front(
+        &self,
+        mut front: NonNull<LscqNode<T>>,
+        pause: &Pause<'_, OwnedAlloc<LscqNode<T>>>,
+    ) -> Option<()> {
+        loop {
+            if unsafe { front.as_ref().is_live.swap(false, AcqRel) } {
+                unsafe { self.try_clear_first(front, &pause) };
+                break Some(());
+            } else {
+                // It is already dead.
+                front = unsafe { self.try_clear_first(front, &pause) }?;
             }
         }
     }
     /// Replaces the front of the queue with the next node, inserting
     /// the previous front into the incinerator.
-    /// 
+    ///
     /// Heavily inspired by the following code from [lockfree]:
     /// https://gitlab.com/bzim/lockfree/-/blob/master/src/queue.rs?ref_type=heads
-    /// 
+    ///
     /// SAFETY: For this method to be safe several things must be upheld:
     /// 1. The nonnull points to a valid non-null pointer allocated by [OwnedAlloc].
     /// 2. The incinerator is paused.
     unsafe fn try_clear_first(
         &self,
         expected: NonNull<LscqNode<T>>,
-        pause: &Pause<'_, OwnedAlloc<LscqNode<T>>>
+        pause: &Pause<'_, OwnedAlloc<LscqNode<T>>>,
     ) -> Option<NonNull<LscqNode<T>>> {
         // SAFETY: There are no mutable references to expected and it
         // is a non-null pojinter.
@@ -602,9 +604,12 @@ impl<T: Clone> LcsqQueue<T> {
                 }
             }
         })
-
     }
 }
+
+
+
+
 
 impl<T> Drop for LcsqQueue<T> {
     fn drop(&mut self) {
@@ -636,11 +641,10 @@ unsafe fn free_owned_alloc<T>(ptr: *mut T) {
 mod tests {
     use crate::scq::{LcsqQueue, ScqError, ScqQueue, ScqRing, lfring_signed_cmp};
 
-
     #[test]
     pub fn fullinit() {
         let mut ring = ScqRing::new_full(3);
-        
+
         for i in 0..16 {
             assert_eq!(ring.dequeue(), Some(i));
         }
@@ -661,20 +665,26 @@ mod tests {
         println!("HELLO: {:?}", ring.dequeue());
     }
 
-
     #[test]
     pub fn test_length_function() {
         let ring = ScqRing::new(2);
         assert_eq!(ring.capacity(), 8);
 
-        println!("Threshold: {}", ring.threshold.load(std::sync::atomic::Ordering::SeqCst));
+        println!(
+            "Threshold: {}",
+            ring.threshold.load(std::sync::atomic::Ordering::SeqCst)
+        );
 
         ring.enqueue(3).unwrap();
-        println!("Threshold: {}", ring.threshold.load(std::sync::atomic::Ordering::SeqCst));
+        println!(
+            "Threshold: {}",
+            ring.threshold.load(std::sync::atomic::Ordering::SeqCst)
+        );
         ring.enqueue(2).unwrap();
-        println!("Threshold: {}", ring.threshold.load(std::sync::atomic::Ordering::SeqCst));
-
-
+        println!(
+            "Threshold: {}",
+            ring.threshold.load(std::sync::atomic::Ordering::SeqCst)
+        );
     }
 
     #[test]

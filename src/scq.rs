@@ -6,9 +6,10 @@
 // use std::sync::atomic::{AtomicIsize, AtomicUsize};
 
 use std::cell::UnsafeCell;
-use std::{cmp, vec};
+use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::ptr::{NonNull, null_mut};
+use std::{cmp};
 
 #[cfg(loom)]
 use loom::sync::atomic::{AtomicBool, AtomicIsize, AtomicPtr, AtomicUsize, Ordering::*};
@@ -20,8 +21,15 @@ use crossbeam_utils::CachePadded;
 use lockfree::incin::{Incinerator, Pause};
 use owned_alloc::OwnedAlloc;
 
+const SCQ_RING_NORMAL: usize = 0;
+const SCQ_RING_FINALIZABLE: usize = 1;
+
+
+pub type FinalizableRing = ScqRing<true>;
+pub type NormalRing = ScqRing<false>;
+
 #[derive(Debug)]
-struct ScqRing {
+pub struct ScqRing<const MODE: bool> {
     is_finalized: CachePadded<AtomicBool>,
     head: CachePadded<AtomicUsize>,
     tail: CachePadded<AtomicUsize>,
@@ -29,6 +37,24 @@ struct ScqRing {
     array: Box<[ScqEntry]>,
     order: usize,
 }
+
+
+impl<const MODE: bool> PartialEq for ScqRing<MODE> {
+    fn eq(&self, other: &Self) -> bool {
+        self.is_finalized.load(Relaxed) == other.is_finalized.load(Relaxed)
+            && self.head.load(Relaxed) == other.head.load(Relaxed)
+            && self.tail.load(Relaxed) == other.tail.load(Relaxed)
+            && self.threshold.load(Relaxed) == other.threshold.load(Relaxed)
+            && self.order == other.order
+            && self
+                .array
+                .iter()
+                .zip(other.array.iter())
+                .all(|(a, b)| a.value.load(Relaxed) == b.value.load(Relaxed))
+    }
+}
+
+impl<const MODE: bool> Eq for ScqRing<MODE> {}
 
 #[inline(always)]
 fn lfring_threshold3(half: usize, n: usize) -> usize {
@@ -63,7 +89,10 @@ fn allocate_atomic_array_empty(order: usize) -> ScqAlloc {
     let array = (0..n)
         .map(|_| AtomicUsize::new((-1isize) as usize))
         .map(CachePadded::new)
-        .map(|v| ScqEntry { value: v, is_safe: CachePadded::new(AtomicBool::new(true)) })
+        .map(|v| ScqEntry {
+            value: v,
+            // is_safe: CachePadded::new(AtomicBool::new(true)),
+        })
         .collect::<Vec<_>>()
         .into_boxed_slice();
     ScqAlloc {
@@ -91,8 +120,13 @@ fn allocate_atomic_array_full(order: usize) -> ScqAlloc {
     //     .into_boxed_slice();
 
     let mut i = 0;
+    while i != half {
+        vector[lfring_map(i, n)].store(n + lfring_map(i, half), Relaxed);
+        i += 1;
+    }
+
     while i != n {
-        vector[lfring_map(i, n)].store(n + lfring_map(i, n), Relaxed);
+        vector[lfring_map(i, n)].store(-1isize as usize, Relaxed);
         i += 1;
     }
 
@@ -102,12 +136,16 @@ fn allocate_atomic_array_full(order: usize) -> ScqAlloc {
     // }
 
     ScqAlloc {
-        array: vector.into_iter().map(|value| ScqEntry {
-            value,
-            is_safe: CachePadded::new(AtomicBool::new(true))
-        }).collect::<Vec<_>>().into_boxed_slice(),
-        tail: lfring_threshold3(half, n),
-        thresh: half as isize,
+        array: vector
+            .into_iter()
+            .map(|value| ScqEntry {
+                value,
+                // is_safe: CachePadded::new(AtomicBool::new(true)),
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+        tail: half,
+        thresh: lfring_threshold3(half, n) as isize,
     }
 }
 
@@ -122,13 +160,16 @@ fn allocate_atomic_array_full(order: usize) -> ScqAlloc {
 
 // }
 
+#[repr(transparent)]
 #[derive(Debug)]
 struct ScqEntry {
     value: CachePadded<AtomicUsize>,
-    is_safe: CachePadded<AtomicBool>
+    // is_safe: CachePadded<AtomicBool>,
 }
 
-impl ScqRing {
+
+
+impl<const MODE: bool> ScqRing<MODE> {
     pub fn new(order: usize) -> Self {
         let array = allocate_atomic_array_empty(order);
         Self::new_from_sqalloc(order, array)
@@ -145,6 +186,8 @@ impl ScqRing {
             array,
         }: ScqAlloc,
     ) -> Self {
+        
+        // assert!(order >= 1, "Order must at least be three.");
         Self {
             is_finalized: CachePadded::new(AtomicBool::new(false)),
             head: CachePadded::new(AtomicUsize::new(0)),
@@ -157,6 +200,9 @@ impl ScqRing {
 
     /// Finalizes the [ScqRing] so no more elements may be stored.
     fn finalize(&self) {
+        if const { !MODE } {
+            panic!("Called finalize() on a non-finalizable ring.");
+        }
         self.is_finalized.store(true, Release);
     }
     // Tail: 0, Tcycle: 15, Tidx: 0, entry: -1
@@ -166,35 +212,48 @@ impl ScqRing {
             return Err(ScqError::IndexLargerThanOrder);
         }
 
+        // println!("Self: {}", self.threshold.load(SeqCst));
+
         let half = lfring_pow2(self.order);
         let n = half * 2;
 
         // Modulo the value.
+        // println!("ORIGINAL EIDX: {eidx}, {}", n - 1);
         eidx ^= n - 1;
+
+        // println!("EIDX: {}, N: {}", eidx, n);
 
         loop {
             let tail = self.tail.fetch_add(1, AcqRel);
             let tcycle = modup(tail << 1, n);
             let tidx = lfring_map(tail, n);
-            let entry = self.array[tidx].value.load(Acquire);
+            // let mut entry = self.array[tidx].value.load(Acquire);
 
             // println!("Tail: {tail}, TCycle: {tcycle}, TIDX: {tidx}, Entry: {entry}");
 
             'retry: loop {
+                let entry = self.array[tidx].value.load(Acquire);
+
+                // println!("Entering retry... {}", sel);
                 let ecycle = modup(entry, n);
                 // let ecycle = entry | (2 * n - 1);
                 // println!("ECycle: {}", ecycle as isize);
 
                 //   exit(1);
+                // println!("Entry: {}, Ecycle: {}", entry as isize, ecycle as isize);
 
                 if (lfring_signed_cmp(ecycle, tcycle).is_lt())
                     && ((entry == ecycle)
                         || ((entry == (ecycle ^ n))
                             && lfring_signed_cmp(self.head.load(Acquire), tail).is_le()))
                 {
-                    if self.is_finalized.load(Acquire) {
-                        return Err(ScqError::QueueFinalized);
+                    if const { MODE } {
+                        // Check the finalization, we want this to be compiled conditionally.
+                        if self.is_finalized.load(Acquire) {
+                            return Err(ScqError::QueueFinalized);
+                        }
                     }
+                    
 
                     if self.array[tidx]
                         .value
@@ -202,23 +261,36 @@ impl ScqRing {
                         .is_err()
                     {
                         yield_marker();
+                        // println!("Spinning here...");
                         continue 'retry;
                     }
 
-                    if self.threshold.load(SeqCst) != lfring_threshold3(half, n) as isize {
-                        self.threshold
-                            .store(lfring_threshold3(half, n) as isize, SeqCst);
+                    let threshold = lfring_threshold3(half, n) as isize;
+                    if self.threshold.load(SeqCst) != threshold {
+                        self.threshold.store(threshold, SeqCst);
                     }
+
                     return Ok(());
                 } else {
                     break;
                 }
             }
+            // return Err(ScqError::QueueFull);
+            // println!("loop c");
             yield_marker();
+
+            // println!("Trigger");
+
+            // println!("Entry: {}, Tcycle: {}", entry as isize, tcycle as isize);
+            // println!("traj");
+
+            // NOTE: We can return here as this generally only fails if it is empty, but this is not universally
+            // true.
+            // return Err(ScqError::QueueFull);
         }
     }
     pub fn capacity(&self) -> usize {
-        1 << (self.order + 1)
+        1 << (self.order)
     }
     fn catchup(&self, mut tail: usize, mut head: usize) {
         while self
@@ -234,7 +306,7 @@ impl ScqRing {
         }
     }
     pub fn dequeue(&self) -> Option<usize> {
-        let n = self.capacity();
+        let n = 1 << (self.order + 1);
 
         if self.threshold.load(SeqCst) < 0 {
             return None;
@@ -242,29 +314,28 @@ impl ScqRing {
 
         let mut entry_new;
 
-
         loop {
-            let mut head = self.head.fetch_add(1, AcqRel);
-            let mut hcycle = modup(head << 1, n);
-            let mut hidx = lfring_map(head, n);
+            let head = self.head.fetch_add(1, AcqRel);
+            let hcycle = modup(head << 1, n);
+            let hidx = lfring_map(head, n);
             let mut attempt = 0;
             // println!("Entering dequeue loop...");
 
             'again: loop {
-                
                 // START DO
                 loop {
                     let entry = self.array[hidx].value.load(Acquire);
-                
+
                     // println!("Retry loop...");
                     let ecycle = modup(entry, n);
                     // println!("Ecycle: {}, Hcycle: {}", ecycle, hcycle);
                     if ecycle == hcycle {
+                        // NOTE: IN THE SOURCE THIS IS n - 1s
                         self.array[hidx].value.fetch_or(n - 1, AcqRel);
+                        // println!("Dentry: {entry}, Ecycle: {ecycle}, Hidx: {hidx}, Head: {head}, Hcycle: {hcycle}");
                         return Some(entry & (n - 1));
                     }
 
-                    
                     if (entry | n) != ecycle {
                         entry_new = entry & !n;
                         if entry == entry_new {
@@ -272,7 +343,7 @@ impl ScqRing {
                         }
                     } else {
                         attempt += 1;
-                        if attempt <= 100 {
+                        if attempt <= 10 {
                             yield_marker();
                             // println!("Looping here...");
                             continue 'again;
@@ -313,6 +384,7 @@ impl ScqRing {
             yield_marker();
         }
     }
+   
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -327,46 +399,55 @@ pub enum ScqError {
 }
 
 #[derive(Debug)]
-pub struct ScqQueue<T> {
+pub struct ScqQueue<T, const SEAL: bool> {
     backing: Box<[UnsafeCell<Option<T>>]>,
-    free_queue: ScqRing,
-    alloc_queue: ScqRing,
+    free_queue: ScqRing<SEAL>,
+    alloc_queue: ScqRing<SEAL>,
     used: CachePadded<AtomicUsize>,
     _type: PhantomData<T>,
 }
 
-unsafe impl<T> Send for ScqQueue<T> {}
-unsafe impl<T> Sync for ScqQueue<T> {}
 
-impl<T> ScqQueue<T> {
+unsafe impl<T, const S: bool> Send for ScqQueue<T, S> {}
+unsafe impl<T, const S: bool> Sync for ScqQueue<T, S> {}
+
+impl<T> ScqQueue<T, false> {
     pub fn new(order: usize) -> Self {
-        // let ring = ScqRing::new(order);
-        let size = 1 << (order + 1);
-        // let ring = ScqRing::n
+        Self::hidden_new(order)
+    }
+}
 
+impl<T, const S: bool> ScqQueue<T, S> {
+
+    pub const MAX_ORDER: usize = 63;
+    pub const MIN_ORDER: usize = 2;
+
+    fn hidden_new(order: usize) -> Self {
+        let size = 1 << (order + 1);
         Self {
-            backing: 
-                (0..size)
-                    .map(|_| UnsafeCell::new(None))
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice()
-            ,
+            backing: (0..size)
+                .map(|_| UnsafeCell::new(None))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
             free_queue: ScqRing::new_full(order),
             alloc_queue: ScqRing::new(order),
             used: CachePadded::new(AtomicUsize::new(0)),
             _type: PhantomData,
         }
     }
+    pub fn capacity(&self) -> usize {
+        self.free_queue.capacity()
+    }
     pub fn enqueue(&self, item: T) -> Result<(), ScqError> {
         // We want to make a call to the internal method here
         // without finalizing. If someone is calling the method
         // with [ScqQueue::enqueue] then it is not part of an unbounded
         // queue.
-        self.enqueue_cycle(item, false).map_err(|(_, b)| b)
+        self.enqueue_cycle::<false>(item).map_err(|(_, b)| b)
     }
 
     #[inline(always)]
-    fn enqueue_cycle(&self, item: T, finalize: bool) -> Result<(), (T, ScqError)> {
+    fn enqueue_cycle<const FINALIZE: bool>(&self, item: T) -> Result<(), (T, ScqError)> {
         // let current = self.used.fetch_add(1, Acquire);
 
         // Check if we
@@ -380,15 +461,19 @@ impl<T> ScqQueue<T> {
         // self.used.fetch_add(1, Acquire);
 
         let Some(pos) = self.free_queue.dequeue() else {
+            self.used.fetch_sub(1, AcqRel);
             return Err((item, ScqError::QueueFull));
         };
 
+        // println!("Enqueing @ {pos}");
         // println!("Accessing {pos}...");
 
+        // println!("[ {pos} ]");
         // let pos = self.free_queue.dequeue().expect("Queue should be able to store 2^(order + 1) items but errored while dequeing a free slot that should have been present.");
 
         // SAF
         unsafe { (*self.backing[pos].get()) = Some(item) };
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release); // prevent reordering
         // unsafe { (&mut *self.backing.get())[pos] = Some(item) };
         // let slot = unsafe { &mut (&mut *self.backing.get())[pos] };
 
@@ -397,14 +482,19 @@ impl<T> ScqQueue<T> {
         // unsafe { *slot.get() = Some(item) };
 
         if let Err(error) = self.alloc_queue.enqueue(pos) {
+            println!("error");
+            self.used.fetch_sub(1, AcqRel);
             let item = unsafe { (*self.backing[pos].get()).take() };
+            self.free_queue.enqueue(pos).unwrap();
             return Err((item.unwrap(), error));
         }
 
-        if finalize {
+        // println!("Scheduled @ {pos}");
+        if const { FINALIZE } {
             // As described in the paper we must finalize this queue
             // so that nothing more will be added to it.
             if size + 1 >= self.free_queue.capacity() {
+                // println!("Hello...");
                 self.alloc_queue.finalize();
             }
         }
@@ -413,19 +503,39 @@ impl<T> ScqQueue<T> {
 
         Ok(())
     }
-    pub fn dequeue(&self) -> Option<T> {
+    pub fn dequeue(&self) -> Option<T>
+    where
+        T: Debug + Clone,
+    {
         // println!("Starting dequeue../. (A)");
         let pos = self.alloc_queue.dequeue()?;
+        // println!("Position: {pos}");
         // println!("Finishing dequeue... (A)");
+
+        // println!("Pos: {:?}", pos);
 
         self.used.fetch_sub(1, AcqRel);
 
-        let value = unsafe { (*self.backing[pos].get()).take().unwrap() };
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire); // prevent reordering
+        let value = unsafe { (*self.backing[pos].get()).take() };
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release); // prevent reordering
+
+        let Some(value) = value else {
+            panic!("Failed to fetch, the position was: {pos}");
+        };
 
         // let value = unsafe { &mut *self.holder[pos].get() }.take().unwrap();
 
+        // println!("{{ {pos} }}");
+
         // This slot is now freed again!
-        self.free_queue.enqueue(pos).unwrap();
+
+        if let Err(e) = self.free_queue.enqueue(pos) {
+            // println!("{self:?}");
+
+            panic!("ScqError: {e:?}");
+        }
+        // self.free_queue.enqueue(pos).unwrap();
 
         Some(value)
     }
@@ -458,7 +568,7 @@ pub struct LcsqQueue<T> {
 #[derive(Debug)]
 struct LscqNode<T> {
     is_live: AtomicBool,
-    value: ScqQueue<T>,
+    value: ScqQueue<T, true>,
     next: AtomicPtr<LscqNode<T>>,
 }
 
@@ -469,24 +579,23 @@ impl<T> LscqNode<T> {
         OwnedAlloc::new(Self {
             is_live: AtomicBool::new(true),
             next: AtomicPtr::default(),
-            value: ScqQueue::new(order),
+            value: ScqQueue::hidden_new(order),
         })
     }
     fn new(order: usize) -> Self {
         Self {
             is_live: AtomicBool::new(true),
             next: AtomicPtr::default(),
-            value: ScqQueue::new(order)
+            value: ScqQueue::hidden_new(order),
         }
     }
 }
 
 #[inline(always)]
 fn yield_marker() {
-    std::thread::yield_now();
+    // std::thread::yield_now();
     #[cfg(loom)]
     loom::thread::yield_now();
-    
 }
 
 /// Bypasses the null check for the creation of a [NonNull]. There
@@ -529,7 +638,10 @@ impl<T> LcsqQueue<T> {
         }
     }
     /// Enqueues an element of type `T` into the queue.
-    pub fn enqueue(&self, mut element: T) {
+    pub fn enqueue(&self, mut element: T)
+    where
+        T: Clone + Debug,
+    {
         loop {
             let cq_ptr = self.tail.load(Acquire);
             // SAFETY: The tail can never be a null pointer so we can
@@ -539,17 +651,18 @@ impl<T> LcsqQueue<T> {
 
             // If the next pointer is not null then we want to keep
             // going next until we have found the end.
-            if !cq.next.load(Acquire).is_null() {
+            let next_ptr = cq.next.load(Acquire);
+            if !next_ptr.is_null() {
                 let _ = self
                     .tail
-                    .compare_exchange(cq_ptr, cq.next.load(Acquire), AcqRel, Acquire);
+                    .compare_exchange(cq_ptr, next_ptr, AcqRel, Acquire);
                 yield_marker();
                 continue;
             }
 
             // Attempts to enqueue the item, we should finalize the
             // queue if we can.
-            match cq.value.enqueue_cycle(element, true) {
+            match cq.value.enqueue_cycle::<true>(element) {
                 Ok(_) => {
                     // We are done and have succesfully enqueued the item.
                     return;
@@ -563,22 +676,26 @@ impl<T> LcsqQueue<T> {
 
             // Allocate a new queue.
             // std::sync::atomic::fence(Acquire);
+
             let ncq = LscqNode::new(self.internal_order);
             ncq.value
                 .enqueue(element)
                 .expect("Freshly allocated queue could not accept one value.");
-            let ncq = OwnedAlloc::new(ncq).into_raw().as_ptr();
-
-            // std::sync::atomic::fence(Release);
+            // The forget_inner prevents miri from detecting data race?
+            let ncq = OwnedAlloc::new(ncq).forget_inner().into_raw();
+            // std::sync::atomic::compiler_fence(SeqCst);
+            // std::sync::atomic::fence(SeqCst);
 
             // Try to insert a new tail into the queue.
             if cq
                 .next
-                .compare_exchange(null_mut(), ncq, AcqRel, Acquire)
+                .compare_exchange(null_mut(), ncq.as_ptr(), AcqRel, Acquire)
                 .is_ok()
             {
                 // Correct the list ordering.
-                let _ = self.tail.compare_exchange(cq_ptr, ncq, AcqRel, Acquire);
+                let _ = self
+                    .tail
+                    .compare_exchange(cq_ptr, ncq.as_ptr(), AcqRel, Acquire);
                 // NOTE: We do not have to free the allocation here
                 // because we haave succesfully put it into the list.
                 return;
@@ -588,12 +705,12 @@ impl<T> LcsqQueue<T> {
             // can avoid clones.
             // SAFETY: This is the only instance of this pointer
             // and it is non-null because we allocated it with `OwnedAlloc`.
-            element = unsafe { (&mut *ncq).value.dequeue().unwrap() };
+            element = unsafe { ncq.as_ref().value.dequeue().unwrap() };
 
             // SAFETY: The allocation was created with `OwnedAlloc` and we
             // have unique access to it.
             unsafe {
-                free_owned_alloc(ncq);
+                free_owned_alloc(ncq.as_ptr());
             }
 
             yield_marker();
@@ -601,7 +718,10 @@ impl<T> LcsqQueue<T> {
     }
     /// Removes an element from the queue returning an [Option]. If the queue
     /// is empty then the returned value will be [Option::None].
-    pub fn dequeue(&self) -> Option<T> {
+    pub fn dequeue(&self) -> Option<T>
+    where
+        T: Debug + Clone,
+    {
         // Since dequeue actually removes nodes, we need to pause the incinerator
         // for the time being.
         // println!("Pausing...");
@@ -644,6 +764,7 @@ impl<T> LcsqQueue<T> {
             }
 
             // Here we remove the SCQ.
+            // let cq_ptr = unsafe { NonNull::new_unchecked(self.head.load(Acquire)) };
             unsafe { self.free_front(cq_ptr, &pause) }?;
 
             yield_marker();
@@ -662,6 +783,7 @@ impl<T> LcsqQueue<T> {
         mut front: NonNull<LscqNode<T>>,
         pause: &Pause<'_, OwnedAlloc<LscqNode<T>>>,
     ) -> Option<()> {
+        // println!("Entering switch...");
         loop {
             // println!("entering free loop...");
             if unsafe { front.as_ref().is_live.swap(false, AcqRel) } {
@@ -671,6 +793,7 @@ impl<T> LcsqQueue<T> {
                 unsafe { self.try_clear_first(front, pause) };
                 break Some(());
             } else {
+                // println!("Switching up...");
                 // It is already dead, we can help try to clear it.
                 front = unsafe { self.try_clear_first(front, pause) }?;
             }
@@ -748,50 +871,160 @@ unsafe fn free_owned_alloc<T>(ptr: *mut T) {
 
 #[cfg(test)]
 mod tests {
-    use crate::scq::{LcsqQueue, ScqError, ScqQueue, ScqRing, lfring_signed_cmp};
+    use std::marker::PhantomData;
+
+    use lockfree::queue;
+
+    use crate::scq::{
+        LcsqQueue, ScqError, ScqQueue, ScqRing,
+        lfring_signed_cmp,
+    };
 
     #[cfg(loom)]
     #[test]
-    #[test]
-    pub fn loom_unbounded_queue() {
+    pub fn loom_finalization_weak() {
+        // Checks that post finalization we cannot insert anything into the queue.
         loom::model(|| {
-            let ring = LcsqQueue::new(2);
-            for i in 0..16 {
-                ring.enqueue(i);
-            }
-            for i in 0..16 {
-                assert_eq!(ring.dequeue(), Some(i));
-            }
+            use loom::sync::atomic::Ordering;
+
+            let v1 = loom::sync::Arc::new(ScqRing::<true>::new(3));
+            let v2 = v1.clone();
+
+            // Finalize the queue.
+            v1.finalize();
+
+            loom::thread::spawn(move || {
+                // Anything after this should be an error.
+                assert!(v1.enqueue(0).is_err());
+            });
+        
         });
     }
 
-    #[cfg(loom)]
-    #[test]
-    pub fn loom_bounded_ring() {
-        loom::model(|| {
-            let ring = ScqRing::new(2);
+    // #[cfg(loom)]
+    // #[test]
+    // pub fn loom_bounded_queue() {
+    //     loom::model(|| {
+    //         let ring = loom::sync::Arc::new(ScqQueue::new(4));
 
-            for i in 0..ring.capacity() {
-                ring.enqueue(i).unwrap();
-            }
+    //         let mut handles = vec![];
 
-            for i in 0..ring.capacity() {
-                assert_eq!(ring.dequeue(), Some(i));
-            }
-        });
-    }
+    //         for _ in 0..2 {
+    //             handles.push(loom::thread::spawn({
+    //                 let ring = ring.clone();
+    //                 move || {
+    //                     for i in 0..16 {
+    //                         ring.enqueue(i).unwrap();
+    //                     }
+    //                     assert!(ring.dequeue().unwrap() <= 1);
+    //                     // for i in 0..16 {
+    //                     //     assert_eq!(ring.dequeue(), Some(i));
+    //                     // }
+    //                 }
+    //             }));
+    //         }
+
+    //         for handle in handles {
+    //             handle.join().unwrap();
+    //         }
+
+    //         let backed = ring
+    //             .backing
+    //             .iter()
+    //             .map(|f| unsafe { *f.get() }.clone())
+    //             .collect::<Vec<_>>();
+    //         println!("Backed: {backed:?}");
+    //         let mut count = 0;
+    //         for i in 0..32 {
+    //             // SAFETY: All threads have terminated, we have exclusive access.
+    //             // assert!(backed[i].is_some());
+    //             if backed[i].is_some() {
+    //                 count += 1;
+    //             }
+    //         }
+    //         assert_eq!(count, 30);
+    //     });
+    // }
+
+    // #[cfg(not(loom))]
+    // #[test]
+    // pub fn unloom_bounded_queue() {
+    //     // loom::model(|| {
+    //     let ring = std::sync::Arc::new(ScqQueue::new(4));
+
+    //     let mut handles = vec![];
+
+    //     for _ in 0..2 {
+    //         handles.push(std::thread::spawn({
+    //             let ring = ring.clone();
+    //             move || {
+    //                 for i in 0..16 {
+    //                     ring.enqueue(i).unwrap();
+    //                 }
+    //                 assert!(ring.dequeue().unwrap() <= 1);
+    //                 // assert_eq!(ring.dequeue(), Some(0));
+    //                 // for i in 0..16 {
+    //                 //     assert_eq!(ring.dequeue(), Some(i));
+    //                 // }
+    //             }
+    //         }));
+    //     }
+
+    //     for handle in handles {
+    //         handle.join().unwrap();
+    //     }
+
+    //     let backed = ring
+    //         .backing
+    //         .iter()
+    //         .map(|f| unsafe { *f.get() }.clone())
+    //         .collect::<Vec<_>>();
+    //     println!("Backed: {backed:?}");
+    //     for i in 0..32 {
+    //         // SAFETY: All threads have terminated, we have exclusive access.
+    //         assert!(backed[i].is_some());
+    //     }
+
+    //     // for val in ring.backing {
+    //     //     // SAFETY: We have exclusive access as all threads have terminated.
+    //     //     val.get_mut()
+    //     // }
+
+    //     while let Some(val) = ring.dequeue() {
+    //         println!("Value: {val}");
+    //     }
+    //     // });
+    // }
+
+    // #[cfg(loom)]
+    // #[test]
+    // pub fn loom_bounded_ring() {
+    //     loom::model(|| {
+    //         let ring = ScqRing::new(2);
+
+    //         for i in 0..ring.capacity() {
+    //             ring.enqueue(i).unwrap();
+    //         }
+
+    //         for i in 0..ring.capacity() {
+    //             assert_eq!(ring.dequeue(), Some(i));
+    //         }
+    //     });
+    // }
+
+    
 
     #[cfg(not(loom))]
     #[test]
     pub fn lcsq_circus() {
         use std::sync::{Arc, Barrier};
 
-        let context = Arc::new(LcsqQueue::new(3));
+        let context = Arc::new(ScqQueue::new(3));
 
-        let threads = 25;
-        let thread_runs = 10;
+        let threads = 50;
+        let thread_runs = 100;
 
-        let barrier = Arc::new(Barrier::new(threads));
+        // let barrier = Arc::new(Barrier::new(threads));
 
         // let barrier_finalized = Arc::new(Barrier::new(threads + 1));
         let mut handles = vec![];
@@ -799,14 +1032,14 @@ mod tests {
             handles.push(std::thread::spawn({
                 // let barrier_finalized = barrier_finalized.clone();
                 let context = context.clone();
-                let barrier = barrier.clone();
+                // let barrier = barrier.clone();
                 move || {
-                    barrier.wait();
+                    // barrier.wait();
                     // println!("hello");
                     for i in 0..thread_runs {
                         // println!("start queue...");
-                        context.enqueue(i);
-                        // println!("end queue..."); 
+                        let _ = context.enqueue(i);
+                        // println!("end queue...");
                         // context.lock().unwrap().push_back(std::hint::black_box(i));
                     }
                     for _ in 0..thread_runs {
@@ -816,8 +1049,6 @@ mod tests {
                         // dequeue(&context);
                         // context.lock().unwrap().pop_front();
                     }
-                    // println!("I'm done.");
-                    // barrier_finalized.wait();
                 }
             }));
         }
@@ -830,12 +1061,54 @@ mod tests {
         // println!("Done");
     }
 
+
+    #[test]
+    pub fn verify_small_queue_correctness() {
+
+        fn queue_harness( order: usize) {
+            let queue = ScqQueue::new(order);
+            assert_eq!(queue.capacity(), 1 << order);
+            for i in 0..queue.capacity() {
+                queue.enqueue(i).unwrap();
+            }
+            for i in 0..queue.capacity() {
+                assert_eq!(queue.dequeue(), Some(i));
+            }
+            for i in 0..queue.capacity() {
+                assert_eq!(queue.dequeue(), None);
+            }
+        }
+
+        // Weird effects happen at small queue sized, this checks for that.
+        queue_harness(3);
+        queue_harness(2);
+        queue_harness(1);
+        queue_harness(0);
+
+
+        
+    }
+
+    #[test]
+    #[cfg(not(loom))]
+    pub fn check_scq_fill() {
+        let mut fill = ScqQueue::new(3);
+        for i in 0..8 {
+            fill.enqueue(i).unwrap();
+        }
+        assert_eq!(fill.enqueue(0), Err(ScqError::QueueFull));
+    }
+
+
+
+
+
     #[cfg(not(loom))]
     #[test]
     pub fn fullinit() {
-        let ring = ScqRing::new_full(3);
+        let ring = ScqRing::<false>::new_full(3);
 
-        for i in 0..16 {
+        for i in 0..8 {
             assert_eq!(ring.dequeue(), Some(i));
         }
     }
@@ -843,7 +1116,7 @@ mod tests {
     #[cfg(not(loom))]
     #[test]
     pub fn test_lcsq_ptr() {
-        let ring = LcsqQueue::new(2);
+        let ring = LcsqQueue::new(3);
         for i in 0..16 {
             ring.enqueue(i);
         }
@@ -859,7 +1132,7 @@ mod tests {
     #[cfg(not(loom))]
     #[test]
     pub fn test_length_function() {
-        let ring = ScqRing::new(2);
+        let ring = ScqRing::<false>::new(3);
         assert_eq!(ring.capacity(), 8);
 
         println!(
@@ -890,12 +1163,16 @@ mod tests {
 
     #[cfg(not(loom))]
     #[test]
-    pub fn test_lfring_ptrs() -> Result<(), ScqError> {
-        let holder = ScqQueue::new(2);
+    pub fn scqqueue_enq_deq() -> Result<(), ScqError> {
+        let holder = ScqQueue::new(3);
         holder.enqueue("A")?;
         holder.enqueue("B")?;
+        println!("Enqueued items.");
+
+        // println!("Holder: {:?}", holder);
 
         assert_eq!(holder.dequeue(), Some("A"));
+        println!("pOpped");
         assert_eq!(holder.dequeue(), Some("B"));
 
         assert_eq!(holder.dequeue(), None);
@@ -911,17 +1188,11 @@ mod tests {
         // println!("Value: {:?}", ring);
         // assert_eq!(ring.dequeue(), Some(0x22cf301a020));
 
-        let holder: ScqQueue<&str> = ScqQueue::new(2);
+        let holder: ScqQueue<&str, false> = ScqQueue::new(3);
         println!("Holder: {:?}", holder);
-        holder.enqueue("A").unwrap();
-        holder.enqueue("B").unwrap();
-        holder.enqueue("C").unwrap();
-        holder.enqueue("D").unwrap();
-
-        holder.enqueue("E").unwrap();
-        holder.enqueue("F").unwrap();
-        holder.enqueue("G").unwrap();
-        holder.enqueue("H").unwrap();
+        for _ in 0..holder.alloc_queue.capacity() {
+            holder.enqueue("A").unwrap();
+        }
 
         assert_eq!(holder.enqueue("I"), Err(ScqError::QueueFull));
         // holder.enqueue("J").unwrap();
@@ -939,7 +1210,7 @@ mod tests {
     #[cfg(not(loom))]
     #[test]
     pub fn test_lfring_basic() {
-        let ring = ScqRing::new(2);
+        let ring = ScqRing::<false>::new(3);
 
         // ring.enqueue(303030).unwrap();
 
@@ -954,29 +1225,53 @@ mod tests {
 
     #[cfg(not(loom))]
     #[test]
-    pub fn test_lfring() {
-        // println!("Bruh: {}", (-1isize as usize));
+    pub fn initialize_full_correctly() {
+        use std::sync::atomic::Ordering;
 
-        let queue = ScqRing::new(2);
-        println!("Queue: {:?}", queue);
-        queue.enqueue(4).unwrap();
-        println!("Queue: {:?}", queue);
-        queue.enqueue(2).unwrap();
-        println!("Queue: {:?}", queue);
-        queue.enqueue(3).unwrap();
-        println!("Queue: {:?}", queue);
-        queue.enqueue(6).unwrap();
-        println!("Queue: {:?}", queue);
+        let mut ring = ScqRing::<false>::new(3);
+        for i in 0..ring.capacity() {
+            ring.enqueue(i).unwrap();
+        }
 
-        let val = queue.dequeue();
-        println!("Value: {:?}", val);
-        let val = queue.dequeue();
-        println!("Value: {:?}", val);
-        let val = queue.dequeue();
-        println!("Value: {:?}", val);
-        let val = queue.dequeue();
-        println!("Value: {:?}", val);
-        let val = queue.dequeue();
-        println!("Value: {:?}", val);
+        // println!("Capacity: {:?}", auto.capacity());
+
+        // auto.enqueue(1).unwrap();
+
+        
+
+        // println!("Value: {:?}", auto.dequeue());
+
+        let mut auto = ScqRing::new_full(3);
+        
+        assert_eq!(ring, auto);
+
+        // for i in 0..16 {
+        //     println!("Value: {:?}", auto.dequeue());
+        // }
+
+        // auto = ring;
+
+        // println!("Manual: {:?}", ring);
+        // println!("Auto: {:?}", auto);
+
+        for i in 0..auto.capacity() {
+            // println!("I: {i}");
+            // let value = ring.enqueue(eidx)
+            let value = auto.dequeue();
+            assert_eq!(value, Some(i));
+            // println!("Enqueing {value:?}...");
+            auto.enqueue(value.unwrap()).unwrap();
+        }
+
+        // println!("Extra: {:?}", auto.dequeue());
+        // println!("Extra: {:?}", auto.dequeue());
+        // println!("Extra: {:?}", auto.dequeue());
+        for i in 0..auto.capacity() {
+            assert_eq!(auto.dequeue(),Some(i));
+            // println!("Dequeing... {:?}", auto.dequeue());
+            // assert_eq!(auto.dequeue(), Some((ring.capacity() - 1) - i));
+        }
+
+
     }
 }

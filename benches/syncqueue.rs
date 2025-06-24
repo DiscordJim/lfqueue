@@ -1,13 +1,22 @@
-use criterion::{BatchSize, BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
-use lfqueue::LcsqQueue;
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
+use lfqueue::{LcsqQueue, ScqQueue};
 use lockfree::queue::Queue;
 use std::collections::VecDeque;
 use std::sync::{Arc, Barrier, Mutex};
+use std::time::Instant;
+
+// NOTE: Our queue takes significantly longer to setup, so we need to make
+// sure that does not leak into the benchmark. Special considerations were given
+// to:
+//
+// https://github.com/bheisler/criterion.rs/issues/475
 
 // ===== Benchmarks =====
 
-pub const THREADS: usize = 5;
-pub const THREAD_RUNS: usize = 10;
+pub const PARAM_CONFIGS: &[(usize, usize)] = &[(1, 100), (10, 100), (100, 100), (100, 10000)];
+
+// pub const THREADS: usize = 100;
+// pub const THREAD_RUNS: usize = 10000;
 
 // async fn do_crossbeam_queue() {
 //     // let q = Arc::new(Scq::new());
@@ -108,25 +117,27 @@ fn run_multithread_benchmark<C: Send + Sync>(
     context: Arc<C>,
     enqueue: fn(&Arc<C>, usize),
     dequeue: fn(&Arc<C>),
+    threads: usize,
+    ops: usize,
 ) where
     C: 'static,
 {
-    let barrier = Arc::new(Barrier::new(THREADS));
+    let barrier = Arc::new(Barrier::new(threads));
 
     // let barrier_finalized = Arc::new(Barrier::new(THREADS + 1));
     let mut handles = vec![];
-    for _ in 0..THREADS {
+    for _ in 0..threads {
         handles.push(std::thread::spawn({
             // let barrier_finalized = barrier_finalized.clone();
             let context = context.clone();
             let barrier = barrier.clone();
             move || {
                 barrier.wait();
-                for i in 0..THREAD_RUNS {
+                for i in 0..ops {
                     enqueue(&context, i);
                     // context.lock().unwrap().push_back(std::hint::black_box(i));
                 }
-                for _ in 0..THREAD_RUNS {
+                for _ in 0..ops {
                     dequeue(&context);
                     // context.lock().unwrap().pop_front();
                 }
@@ -137,14 +148,11 @@ fn run_multithread_benchmark<C: Send + Sync>(
         }));
     }
 
-
     for handle in handles {
         handle.join().unwrap();
     }
     // barrier_finalized.wait();
 }
-
-
 
 // fn get_runtime() -> Runtime {
 //     Builder::new_multi_thread().build().unwrap()
@@ -168,7 +176,6 @@ fn run_multithread_benchmark<C: Send + Sync>(
 //     });
 // }
 
-
 // fn configure_multithread_benchmark(
 //     c: &mut Criterion,
 //     name: &str,
@@ -178,48 +185,112 @@ fn run_multithread_benchmark<C: Send + Sync>(
 
 // }
 
+fn configure_benchmark<R, C>(
+    c: &mut Criterion,
+    name: &str,
+    patterns: &[(usize, usize)],
+    mut routine: R,
+    enqueue: fn(&Arc<C>, usize),
+    dequeue: fn(&Arc<C>),
+) where
+    R: FnMut() -> C + Copy,
+    C: Send + Sync + 'static,
+{
+    for (threads, ops) in patterns {
+        c.bench_function(
+            &format!("{name} enqueue-dequeue | threads={threads}, ops={ops}"),
+            |b| {
+                b.iter_custom(move |iters| {
+
+                     let context = Arc::new(routine());
+
+                    //  println!("iters: {iters}");
+                    let instant = Instant::now();
+
+                    for _ in 0..iters {
+                        // println!("iters: {iters}");
+                        run_multithread_benchmark(context.clone(), enqueue, dequeue, *threads, *ops);
+
+                    }
+                   
+                    
+
+                    
+                    let elapsed = instant.elapsed();
+
+                    drop(context);
+
+                    elapsed
+                });
+                // b.iter_batched(
+                //     || Arc::new(routine()),
+                //     |context| run_multithread_benchmark(context, enqueue, dequeue, *threads, *ops),
+                //     BatchSize::NumBatches(1),
+                // );
+            },
+        );
+    }
+}
+
+fn bench_lockfree_queue(c: &mut Criterion) {
+    // let q = Arc::new(Mutex::new(VecDeque::new()));
+    configure_benchmark(
+        c,
+        "lockfree",
+        PARAM_CONFIGS,
+        || lockfree::queue::Queue::new(),
+        |queue, item| queue.push(item),
+        |queue| {  std::hint::black_box(queue.pop()); }
+    );
+
+    // c.bench_function("lockfree enqueue-dequeue", |b| {
+    //     b.iter_batched(
+    //         || Arc::new(lockfree::queue::Queue::new()),
+    //         |context| {
+    //             run_multithread_benchmark(
+    //                 context,
+    //                 |queue, item| queue.push(item),
+    //                 |queue| {
+    //                     std::hint::black_box(queue.pop());
+    //                 },
+    //             )
+    //         },
+    //         BatchSize::NumBatches(1),
+    //     );
+    // });
+    
+}
 
 fn bench_mutex_queue(c: &mut Criterion) {
     // let q = Arc::new(Mutex::new(VecDeque::new()));
-    c.bench_function("mutex enqueue-dequeue", |b| {
-        b.iter_batched(
-            || Arc::new(Mutex::new(VecDeque::new())),
-            |context| {
-                run_multithread_benchmark(
-                    context,
-                    |queue, item| queue.lock().unwrap().push_back(item),
-                    |queue| {
-                        std::hint::black_box(queue.lock().unwrap().pop_front());
-                    },
-                )
-            },
-            BatchSize::NumBatches(1),
-        );
-    });
+    configure_benchmark(
+        c,
+        "mutex",
+        PARAM_CONFIGS,
+        || Mutex::new(VecDeque::new()),
+        |queue, item| queue.lock().unwrap().push_back(item),
+        |queue| {  std::hint::black_box(queue.lock().unwrap().pop_front()); }
+    );
 }
 
 fn bench_lscq_queue(c: &mut Criterion) {
-    // let q = Arc::new(Mutex::new(VecDeque::new()));
-    c.bench_function("lcsq multithread enqueue-dequeue", |b| {
-        b.iter_batched(
-            || Arc::new(LcsqQueue::new(3)),
-            |context| {
-                run_multithread_benchmark(
-                    context,
-                    |queue, item| {
-                        // println!("Started queue...");
-                         queue.enqueue(item);
-                        //  println!("Done queue...");
-                    },
-                    |queue| {
-                        std::hint::black_box(queue.dequeue());
-                    },
-                )
-            },
-            BatchSize::NumBatches(1),
-        );
-    });
+
+    configure_benchmark(
+        c,
+        "scqring",
+        PARAM_CONFIGS,
+        || ScqQueue::new(4),
+        |queue, item|  {
+            let _ = queue.enqueue(item);
+        },
+        |queue| {  std::hint::black_box(queue.dequeue()); }
+    );
 }
 
-criterion_group!(queues, bench_lscq_queue);
+criterion_group!(
+    queues,
+    bench_lscq_queue,
+    // bench_mutex_queue,
+    // bench_lockfree_queue
+);
 criterion_main!(queues);

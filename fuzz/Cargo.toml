@@ -1,0 +1,51 @@
+[package]
+name = "lfqueue-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1.4.1", features = ["derive"] }
+
+[dependencies.lfqueue]
+path = ".."
+
+[[bin]]
+name = "fuzz_target_1"
+path = "fuzz_targets/fuzz_target_1.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "enqdeq"
+path = "fuzz_targets/enqdeq.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "enqdeqcon"
+path = "fuzz_targets/enqdeqcon.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "initfull"
+path = "fuzz_targets/initfull.rs"
+test = false
+doc = false
+bench = false
+
+
+[[bin]]
+name = "scq_grind"
+path = "fuzz_targets/scq_grind.rs"
+test = false
+doc = false
+bench = false

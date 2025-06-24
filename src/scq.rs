@@ -21,12 +21,8 @@ use crossbeam_utils::CachePadded;
 use lockfree::incin::{Incinerator, Pause};
 use owned_alloc::OwnedAlloc;
 
-const SCQ_RING_NORMAL: usize = 0;
-const SCQ_RING_FINALIZABLE: usize = 1;
 
 
-pub type FinalizableRing = ScqRing<true>;
-pub type NormalRing = ScqRing<false>;
 
 #[derive(Debug)]
 pub struct ScqRing<const MODE: bool> {
@@ -1086,7 +1082,7 @@ mod tests {
         queue_harness(0);
 
 
-        
+
     }
 
     #[test]

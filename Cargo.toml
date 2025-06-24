@@ -7,6 +7,13 @@ edition = "2024"
 [target.'cfg(loom)'.dependencies]
 loom = "0.7.2"
 
+[target.'cfg(fuzzing)'.dependencies]
+arbitrary = { version = "1.4.1", features = ["derive"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(fuzzing)'] }
+
+
 
 [dependencies]
 crossbeam-utils = "0.8.21"

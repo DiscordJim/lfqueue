@@ -11,7 +11,6 @@ dependencies = [
  "memchr",
 ]
 
-
 [[package]]
 name = "arbitrary"
 version = "1.4.1"
@@ -107,6 +106,7 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 name = "lfqueue"
 version = "0.1.0"
 dependencies = [
+ "arbitrary",
  "crossbeam-utils",
  "lockfree",
  "loom",

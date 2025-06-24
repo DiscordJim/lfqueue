@@ -21,13 +21,13 @@ mod fuzzing {
     use crate::ScqError;
 
 
-    #[derive(Arbitrary, Debug)]
+    #[derive(Arbitrary, Debug, Clone)]
     pub enum GrindInstr {
         Enqueue(usize),
         Dequeue
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     pub struct GrindConfiguration {
         pub order: usize,
         pub instructions: Vec<GrindInstr>
@@ -53,6 +53,9 @@ mod fuzzing {
             }
             handle.push_back(value);
             Ok(())
+        }
+        pub fn enqueue_boundless(&self, value: T) {
+            self.queue.lock().unwrap().push_back(value);
         }
         pub fn dequeue(&self) -> Option<T> {
             self.queue.lock().unwrap().pop_front()

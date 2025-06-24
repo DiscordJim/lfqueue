@@ -49,3 +49,24 @@ path = "fuzz_targets/scq_grind.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "lscq_grind"
+path = "fuzz_targets/lscq_grind.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "scq_grind_rt"
+path = "fuzz_targets/scq_grind_rt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lscq_grind_rt"
+path = "fuzz_targets/lscq_grind_rt.rs"
+test = false
+doc = false
+bench = false

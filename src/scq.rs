@@ -416,7 +416,7 @@ impl<T> ScqQueue<T, false> {
 impl<T, const S: bool> ScqQueue<T, S> {
 
     pub const MAX_ORDER: usize = 63;
-    pub const MIN_ORDER: usize = 2;
+    pub const MIN_ORDER: usize = 0;
 
     fn hidden_new(order: usize) -> Self {
         let size = 1 << (order + 1);
@@ -469,7 +469,7 @@ impl<T, const S: bool> ScqQueue<T, S> {
 
         // SAF
         unsafe { (*self.backing[pos].get()) = Some(item) };
-        std::sync::atomic::fence(std::sync::atomic::Ordering::Release); // prevent reordering
+        // std::sync::atomic::fence(std::sync::atomic::Ordering::Release); // prevent reordering
         // unsafe { (&mut *self.backing.get())[pos] = Some(item) };
         // let slot = unsafe { &mut (&mut *self.backing.get())[pos] };
 
@@ -478,7 +478,9 @@ impl<T, const S: bool> ScqQueue<T, S> {
         // unsafe { *slot.get() = Some(item) };
 
         if let Err(error) = self.alloc_queue.enqueue(pos) {
-            println!("error");
+            // println!("error: {:?}", error);
+            debug_assert_eq!(error, ScqError::QueueFinalized, "Received a queue full notification.");
+           
             self.used.fetch_sub(1, AcqRel);
             let item = unsafe { (*self.backing[pos].get()).take() };
             self.free_queue.enqueue(pos).unwrap();
@@ -512,9 +514,9 @@ impl<T, const S: bool> ScqQueue<T, S> {
 
         self.used.fetch_sub(1, AcqRel);
 
-        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire); // prevent reordering
+        // std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire); // prevent reordering
         let value = unsafe { (*self.backing[pos].get()).take() };
-        std::sync::atomic::fence(std::sync::atomic::Ordering::Release); // prevent reordering
+        // std::sync::atomic::fence(std::sync::atomic::Ordering::Release); // prevent reordering
 
         let Some(value) = value else {
             panic!("Failed to fetch, the position was: {pos}");

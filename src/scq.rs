@@ -16,7 +16,7 @@ use haphazard::HazardPointer;
 use loom::sync::atomic::{AtomicBool, AtomicIsize, AtomicPtr, AtomicUsize, Ordering::*};
 
 #[cfg(not(loom))]
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicPtr, AtomicUsize, Ordering::*};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering::*};
 
 use crossbeam_utils::CachePadded;
 
@@ -29,7 +29,7 @@ pub struct ScqRing<const MODE: bool> {
     head: CachePadded<AtomicUsize>,
     tail: CachePadded<AtomicUsize>,
     threshold: CachePadded<AtomicIsize>,
-    array: Box<[ScqEntry]>,
+    array: Box<[CachePadded<AtomicUsize>]>,
     order: usize,
 }
 
@@ -45,7 +45,7 @@ impl<const MODE: bool> PartialEq for ScqRing<MODE> {
                 .array
                 .iter()
                 .zip(other.array.iter())
-                .all(|(a, b)| a.value.load(Relaxed) == b.value.load(Relaxed))
+                .all(|(a, b)| a.load(Relaxed) == b.load(Relaxed))
     }
 }
 
@@ -71,7 +71,7 @@ fn lfring_signed_cmp(a: usize, b: usize) -> cmp::Ordering {
     ((a as isize) - (b as isize)).cmp(&0)
 }
 
-type AtomicIndexArray = Box<[ScqEntry]>;
+type AtomicIndexArray = Box<[CachePadded<AtomicUsize>]>;
 
 struct ScqAlloc {
     tail: usize,
@@ -84,10 +84,6 @@ fn allocate_atomic_array_empty(order: usize) -> ScqAlloc {
     let array = (0..n)
         .map(|_| AtomicUsize::new((-1isize) as usize))
         .map(CachePadded::new)
-        .map(|v| ScqEntry {
-            value: v,
-            // is_safe: CachePadded::new(AtomicBool::new(true)),
-        })
         .collect::<Vec<_>>()
         .into_boxed_slice();
     ScqAlloc {
@@ -133,10 +129,6 @@ fn allocate_atomic_array_full(order: usize) -> ScqAlloc {
     ScqAlloc {
         array: vector
             .into_iter()
-            .map(|value| ScqEntry {
-                value,
-                // is_safe: CachePadded::new(AtomicBool::new(true)),
-            })
             .collect::<Vec<_>>()
             .into_boxed_slice(),
         tail: half,
@@ -155,12 +147,6 @@ fn allocate_atomic_array_full(order: usize) -> ScqAlloc {
 
 // }
 
-#[repr(transparent)]
-#[derive(Debug)]
-struct ScqEntry {
-    value: CachePadded<AtomicUsize>,
-    // is_safe: CachePadded<AtomicBool>,
-}
 
 
 
@@ -227,7 +213,7 @@ impl<const MODE: bool> ScqRing<MODE> {
             // println!("Tail: {tail}, TCycle: {tcycle}, TIDX: {tidx}, Entry: {entry}");
 
             'retry: loop {
-                let entry = self.array[tidx].value.load(Acquire);
+                let entry = self.array[tidx].load(Acquire);
 
                 // println!("Entering retry... {}", sel);
                 let ecycle = modup(entry, n);
@@ -251,7 +237,7 @@ impl<const MODE: bool> ScqRing<MODE> {
                     
 
                     if self.array[tidx]
-                        .value
+                        
                         .compare_exchange_weak(entry, tcycle ^ eidx, AcqRel, Acquire)
                         .is_err()
                     {
@@ -319,14 +305,14 @@ impl<const MODE: bool> ScqRing<MODE> {
             'again: loop {
                 // START DO
                 loop {
-                    let entry = self.array[hidx].value.load(Acquire);
+                    let entry = self.array[hidx].load(Acquire);
 
                     // println!("Retry loop...");
                     let ecycle = modup(entry, n);
                     // println!("Ecycle: {}, Hcycle: {}", ecycle, hcycle);
                     if ecycle == hcycle {
                         // NOTE: IN THE SOURCE THIS IS n - 1s
-                        self.array[hidx].value.fetch_or(n - 1, AcqRel);
+                        self.array[hidx].fetch_or(n - 1, AcqRel);
                         // println!("Dentry: {entry}, Ecycle: {ecycle}, Hidx: {hidx}, Head: {head}, Hcycle: {hcycle}");
                         return Some(entry & (n - 1));
                     }
@@ -349,7 +335,7 @@ impl<const MODE: bool> ScqRing<MODE> {
 
                     if !(lfring_signed_cmp(ecycle, hcycle).is_lt()
                         && self.array[hidx]
-                            .value
+                            
                             .compare_exchange_weak(entry, entry_new, AcqRel, Acquire)
                             .is_err())
                     {
@@ -409,7 +395,6 @@ pub unsafe trait IsolatedSlotable: private::Sealed {
 
 #[derive(Debug)]
 pub struct BoundedQueue<T, I, const SEAL: bool> {
-    // backing: Box<[UnsafeCell<Option<T>>]>,
     backing: I,
     free_queue: ScqRing<SEAL>,
     alloc_queue: ScqRing<SEAL>,
@@ -427,15 +412,17 @@ pub type AllocBoundedQueue<T> = BoundedQueue<T, Box<[UnsafeCell<Option<T>>]>, fa
 /// A constant generic constant bounded queue, this implements the SCQ from the ACM paper,
 /// "A Scalable, Portable, and Memory-Efficient Lock-Free FIFO Queue" by Ruslan Nikolaev.
 /// 
-/// The generic parameter must be chosen intelligently, you must choose N = 2 ^ (x + 1) where
-/// 2 ^ x is the amount of elements you want to store. For instance, for a queue of size 2 (x = 2) then
-/// you would choose N = 2 ^ (2 + 1) = 8;
+/// The generic parameter must be chosen intelligently, you must choose N = 2 * n where
+/// n is the amount of elements you wish to store. For instance, for a buffer of capacity 2 you would
+/// use N = 2 * 2 = 4.
 /// 
 /// # Example
 /// ```
 /// use lfqueue::{ConstBoundedQueue, ScqError};
 /// 
 /// let queue = ConstBoundedQueue::<usize, 4>::new_const_queue();
+/// 
+/// assert_eq!(queue.capacity(), 2);
 /// assert!(queue.enqueue(2).is_ok());
 /// assert!(queue.enqueue(3).is_ok());
 /// assert_eq!(queue.enqueue(4), Err(ScqError::QueueFull));
@@ -475,6 +462,17 @@ impl<T, const N: usize> ConstBoundedQueue<T, N> {
     }
 }
 
+
+/// A bounded queue as described in the ACM paper.
+/// 
+/// Internally, this just manages two independent SCQ rings  & a backing buffer that store
+/// indexes. There are two rings,
+/// - `free ring`: stores all the free indices.
+/// - `alloc ring`: stores all the currently allocated indices.
+/// 
+/// The SCQ rings themselves can *only* store indices, and each queue stores an index uniquely. That is,
+/// an index only ever belongs to the free ring or the alloc ring, but never both.
+/// 
 impl<T, I> BoundedQueue<T, I, false>
 where 
     I: IsolatedSlotable<Type = T>
@@ -541,6 +539,17 @@ where
     pub fn capacity(&self) -> usize {
         self.free_queue.capacity()
     }
+
+    /// Enqueues an element to the bounded queue.
+    /// 
+    /// # Example
+    /// ```
+    /// use lfqueue::AllocBoundedQueue;
+    /// 
+    /// let queue = AllocBoundedQueue::<usize>::new(2);
+    /// assert_eq!(queue.enqueue(4), Ok(()));
+    /// assert_eq!(queue.dequeue(), Some(4));
+    /// ```
     pub fn enqueue(&self, item: T) -> Result<(), ScqError> {
         // We want to make a call to the internal method here
         // without finalizing. If someone is calling the method
@@ -549,6 +558,8 @@ where
         self.enqueue_cycle::<false>(item).map_err(|(_, b)| b)
     }
 
+    /// The internal enqueue function. This prevents cloning by returning the original
+    /// 
     #[inline(always)]
     fn enqueue_cycle<const FINALIZE: bool>(&self, item: T) -> Result<(), (T, ScqError)> {
         // let current = self.used.fetch_add(1, Acquire);
@@ -610,6 +621,16 @@ where
 
         Ok(())
     }
+    /// Dequeues an element from the bounded queue.
+    /// 
+    /// # Example
+    /// ```
+    /// use lfqueue::AllocBoundedQueue;
+    /// 
+    /// let queue = AllocBoundedQueue::<usize>::new(2);
+    /// assert_eq!(queue.enqueue(4), Ok(()));
+    /// assert_eq!(queue.dequeue(), Some(4));
+    /// ```
     pub fn dequeue(&self) -> Option<T>
     {
         // println!("Starting dequeue../. (A)");
@@ -646,27 +667,30 @@ where
     }
 }
 
-// =
-// const LFRING_MIN: usize = LF_CACHE_SHIFT - 3; // for 64-bit = 3
-
+/// The mapping function from the ACM paper.
 #[inline(always)]
 fn lfring_map(idx: usize, n: usize) -> usize {
     idx & (n - 1)
 }
 
 
-// TODO: Concurrent removal, likely need hazard pointers, read original paper.
-// mabe haphazard crate?
-// https://karevongeijer.com/blog/lock-free-queue-in-rust/
+/// The internals of the LCSQ queue, holds the atomic pointers. These are from the `haphazard` crate by
+/// John Gjengset, which is a great way of implementing hazard pointers to address the ABA problem.
+/// 
+/// The structure contains a head and tail and is a basic queue of [BoundedQueue]. Although this queue is
+/// slightly less efficient than the highly efficient [BoundedQueue] implementation, the asymptotic complexity
+/// is largely dominated by the bounded queue.
+/// 
+/// # References
+/// Hazard Pointers & ABA problem, https://karevongeijer.com/blog/lock-free-queue-in-rust/
 #[derive(Debug)]
 pub struct UnboundedQueueInternal<T> {
     head: CachePadded<HazardAtomicPtr<LscqNode<T>>>,
     tail: CachePadded<HazardAtomicPtr<LscqNode<T>>>,
     internal_order: usize,
-    // pointers: ThreadLocal<HazardPointer>
 }
 
-/// Stores the actual [ScqQueue] along with a pointer
+/// Stores the actual [BoundedQueue] along with a pointer
 /// to the next node within the queue. This gives us an
 /// unbounded amount of storage.
 #[derive(Debug)]
@@ -1339,7 +1363,6 @@ mod tests {
         assert!(queue.enqueue(1).is_ok());
         assert!(queue.enqueue(2).is_ok());
         assert_eq!(queue.enqueue(3), Err(ScqError::QueueFull));
-        panic!("hello: {}", queue.capacity());
 
     }
 

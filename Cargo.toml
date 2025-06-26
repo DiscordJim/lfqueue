@@ -17,12 +17,12 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(fuzzing)'] }
 
 [dependencies]
 crossbeam-utils = "0.8.21"
-lockfree = "0.5.1"
-owned-alloc = "0.2.0"
+haphazard = "0.1.8"
 
 [dev-dependencies]
 arbitrary = { version = "1.4.1", features = ["derive"] }
 criterion = "0.6.0"
+lockfree = "0.5.1"
 
 [[bench]]
 name = "syncqueue"

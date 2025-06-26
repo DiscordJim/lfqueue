@@ -11,6 +11,7 @@ use std::marker::PhantomData;
 use std::ptr::{NonNull, null_mut};
 use std::{cmp};
 
+use haphazard::HazardPointer;
 #[cfg(loom)]
 use loom::sync::atomic::{AtomicBool, AtomicIsize, AtomicPtr, AtomicUsize, Ordering::*};
 
@@ -18,8 +19,6 @@ use loom::sync::atomic::{AtomicBool, AtomicIsize, AtomicPtr, AtomicUsize, Orderi
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicPtr, AtomicUsize, Ordering::*};
 
 use crossbeam_utils::CachePadded;
-use lockfree::incin::{Incinerator, Pause};
-use owned_alloc::OwnedAlloc;
 
 
 
@@ -394,9 +393,24 @@ pub enum ScqError {
     QueueFinalized,
 }
 
+mod private {
+    pub trait Sealed {}
+}
+
+
+/// A trait that represents a type.
+pub unsafe trait IsolatedSlotable: private::Sealed {
+    type Type;
+
+    fn new(order: usize) -> Self;
+    unsafe fn unique_index(&self, index: usize) -> *mut Option<Self::Type>;
+
+}
+
 #[derive(Debug)]
-pub struct ScqQueue<T, const SEAL: bool> {
-    backing: Box<[UnsafeCell<Option<T>>]>,
+pub struct BoundedQueue<T, I, const SEAL: bool> {
+    // backing: Box<[UnsafeCell<Option<T>>]>,
+    backing: I,
     free_queue: ScqRing<SEAL>,
     alloc_queue: ScqRing<SEAL>,
     used: CachePadded<AtomicUsize>,
@@ -404,27 +418,120 @@ pub struct ScqQueue<T, const SEAL: bool> {
 }
 
 
-unsafe impl<T, const S: bool> Send for ScqQueue<T, S> {}
-unsafe impl<T, const S: bool> Sync for ScqQueue<T, S> {}
+unsafe impl<T: Send + Sync, I: IsolatedSlotable, const S: bool> Send for BoundedQueue<T, I, S> {}
+unsafe impl<T: Send + Sync, I: IsolatedSlotable, const S: bool> Sync for BoundedQueue<T, I, S> {}
 
-impl<T> ScqQueue<T, false> {
+pub type AllocBoundedQueue<T> = BoundedQueue<T, Box<[UnsafeCell<Option<T>>]>, false>;
+
+
+/// A constant generic constant bounded queue, this implements the SCQ from the ACM paper,
+/// "A Scalable, Portable, and Memory-Efficient Lock-Free FIFO Queue" by Ruslan Nikolaev.
+/// 
+/// The generic parameter must be chosen intelligently, you must choose N = 2 ^ (x + 1) where
+/// 2 ^ x is the amount of elements you want to store. For instance, for a queue of size 2 (x = 2) then
+/// you would choose N = 2 ^ (2 + 1) = 8;
+/// 
+/// # Example
+/// ```
+/// use lfqueue::{ConstBoundedQueue, ScqError};
+/// 
+/// let queue = ConstBoundedQueue::<usize, 4>::new_const_queue();
+/// assert!(queue.enqueue(2).is_ok());
+/// assert!(queue.enqueue(3).is_ok());
+/// assert_eq!(queue.enqueue(4), Err(ScqError::QueueFull));
+/// ```
+pub type ConstBoundedQueue<T, const N: usize> = BoundedQueue<T, [Option<T>; N], false>;
+
+
+
+impl<T, const N: usize> ConstBoundedQueue<T, N> {
+
+    /// A helper function for creating constant bounded queues, will automatically
+    /// try to calculate the correct order.
+    /// 
+    /// # Panics
+    /// This function will panic if the value is not a power of two and also if the
+    /// value is zero as we cannot initialize zero sized constant bounded queues.
+    /// 
+    /// # Example
+    /// ```
+    /// use lfqueue::{ConstBoundedQueue, ScqError};
+    /// 
+    /// let queue = ConstBoundedQueue::<usize, 4>::new_const_queue();
+    /// assert!(queue.enqueue(2).is_ok());
+    /// assert!(queue.enqueue(3).is_ok());
+    /// assert_eq!(queue.enqueue(4), Err(ScqError::QueueFull));
+    /// ```
+    pub fn new_const_queue() -> Self {
+        if const { N } % 2 != 0 {
+            panic!("Value must be a power of two.");
+        }
+        if const { N } == 0 {
+            panic!("Constant arrays cannot be initialized to be empty.");
+        }
+        let order = (const { N } >> 1) - 1;
+        Self::new(order)
+
+    }
+}
+
+impl<T, I> BoundedQueue<T, I, false>
+where 
+    I: IsolatedSlotable<Type = T>
+{
     pub fn new(order: usize) -> Self {
         Self::hidden_new(order)
     }
 }
 
-impl<T, const S: bool> ScqQueue<T, S> {
+impl<T, const N: usize> private::Sealed for [Option<T>; N] {}
+
+unsafe impl<T, const N: usize> IsolatedSlotable for [Option<T>; N] {
+
+    type Type = T;
+
+    /// Creates a new array and checks that N == 1 << (order + 1)
+    fn new(order: usize) -> Self {
+        assert_eq!(1 << (order + 1), const { N }, "N must be equal to 2 ^ (order + 1)");
+        core::array::from_fn(|_| None)
+    }
+
+    unsafe fn unique_index(&self, index: usize) -> *mut Option<Self::Type> {
+        &self[index] as *const Option<T> as *mut Option<T>
+    }
+}
+
+
+impl<T> private::Sealed for Box<[UnsafeCell<Option<T>>]> {}
+
+unsafe impl<T> IsolatedSlotable for Box<[UnsafeCell<Option<T>>]> {
+    type Type = T;
+    fn new(order: usize) -> Self {
+        let size = 1 << (order + 1);
+        (0..size).map(|_| UnsafeCell::new(None)).collect::<Vec<_>>().into_boxed_slice()
+    }
+    unsafe fn unique_index(&self, index: usize) -> *mut Option<Self::Type> {
+        self[index].get()
+    }
+}
+
+//(0..size)
+                // .map(|_| UnsafeCell::new(None))
+                // .collect::<Vec<_>>()
+                // .into_boxed_slice()
+                
+impl<T, I, const S: bool> BoundedQueue<T, I, S>
+where 
+    I: IsolatedSlotable<Type = T>
+{
 
     pub const MAX_ORDER: usize = 63;
     pub const MIN_ORDER: usize = 0;
 
     fn hidden_new(order: usize) -> Self {
-        let size = 1 << (order + 1);
+        // let size = 1 << (order + 1);
         Self {
-            backing: (0..size)
-                .map(|_| UnsafeCell::new(None))
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
+            backing: I::new(order),
             free_queue: ScqRing::new_full(order),
             alloc_queue: ScqRing::new(order),
             used: CachePadded::new(AtomicUsize::new(0)),
@@ -468,7 +575,9 @@ impl<T, const S: bool> ScqQueue<T, S> {
         // let pos = self.free_queue.dequeue().expect("Queue should be able to store 2^(order + 1) items but errored while dequeing a free slot that should have been present.");
 
         // SAF
-        unsafe { (*self.backing[pos].get()) = Some(item) };
+        unsafe { *self.backing.unique_index(pos) = Some(item) };
+        
+        // unsafe { (*self.backing[pos].get()) = Some(item) };
         // std::sync::atomic::fence(std::sync::atomic::Ordering::Release); // prevent reordering
         // unsafe { (&mut *self.backing.get())[pos] = Some(item) };
         // let slot = unsafe { &mut (&mut *self.backing.get())[pos] };
@@ -482,7 +591,7 @@ impl<T, const S: bool> ScqQueue<T, S> {
             debug_assert_eq!(error, ScqError::QueueFinalized, "Received a queue full notification.");
            
             self.used.fetch_sub(1, AcqRel);
-            let item = unsafe { (*self.backing[pos].get()).take() };
+            let item = unsafe { (*self.backing.unique_index(pos)).take() };
             self.free_queue.enqueue(pos).unwrap();
             return Err((item.unwrap(), error));
         }
@@ -502,8 +611,6 @@ impl<T, const S: bool> ScqQueue<T, S> {
         Ok(())
     }
     pub fn dequeue(&self) -> Option<T>
-    where
-        T: Debug + Clone,
     {
         // println!("Starting dequeue../. (A)");
         let pos = self.alloc_queue.dequeue()?;
@@ -515,7 +622,7 @@ impl<T, const S: bool> ScqQueue<T, S> {
         self.used.fetch_sub(1, AcqRel);
 
         // std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire); // prevent reordering
-        let value = unsafe { (*self.backing[pos].get()).take() };
+        let value = unsafe { (*self.backing.unique_index(pos)).take() };
         // std::sync::atomic::fence(std::sync::atomic::Ordering::Release); // prevent reordering
 
         let Some(value) = value else {
@@ -547,17 +654,16 @@ fn lfring_map(idx: usize, n: usize) -> usize {
     idx & (n - 1)
 }
 
-type UnboundedQueueIncinerator<T> = Incinerator<OwnedAlloc<LscqNode<T>>>;
 
 // TODO: Concurrent removal, likely need hazard pointers, read original paper.
 // mabe haphazard crate?
 // https://karevongeijer.com/blog/lock-free-queue-in-rust/
 #[derive(Debug)]
-pub struct LcsqQueue<T> {
-    head: CachePadded<AtomicPtr<LscqNode<T>>>,
-    tail: CachePadded<AtomicPtr<LscqNode<T>>>,
+pub struct UnboundedQueueInternal<T> {
+    head: CachePadded<HazardAtomicPtr<LscqNode<T>>>,
+    tail: CachePadded<HazardAtomicPtr<LscqNode<T>>>,
     internal_order: usize,
-    incin: UnboundedQueueIncinerator<T>,
+    // pointers: ThreadLocal<HazardPointer>
 }
 
 /// Stores the actual [ScqQueue] along with a pointer
@@ -565,26 +671,20 @@ pub struct LcsqQueue<T> {
 /// unbounded amount of storage.
 #[derive(Debug)]
 struct LscqNode<T> {
-    is_live: AtomicBool,
-    value: ScqQueue<T, true>,
-    next: AtomicPtr<LscqNode<T>>,
+    value: BoundedQueue<T, Box<[UnsafeCell<Option<T>>]>, true>,
+    next: haphazard::AtomicPtr<LscqNode<T>>,
 }
 
 impl<T> LscqNode<T> {
     /// Allocates a new [LscqNode] object with an order. This
     /// will create a queue with a size of 2 ^ (order + 1).
-    pub fn allocate(order: usize) -> OwnedAlloc<Self> {
-        OwnedAlloc::new(Self {
-            is_live: AtomicBool::new(true),
-            next: AtomicPtr::default(),
-            value: ScqQueue::hidden_new(order),
-        })
+    pub fn allocate(order: usize) -> NonNull<Self> {
+        NonNull::from(Box::leak(Box::new(Self::new(order))))
     }
     fn new(order: usize) -> Self {
         Self {
-            is_live: AtomicBool::new(true),
-            next: AtomicPtr::default(),
-            value: ScqQueue::hidden_new(order),
+            next: unsafe { haphazard::AtomicPtr::new(std::ptr::null_mut()) },
+            value: BoundedQueue::hidden_new(order),
         }
     }
 }
@@ -596,19 +696,8 @@ fn yield_marker() {
     loom::thread::yield_now();
 }
 
-/// Bypasses the null check for the creation of a [NonNull]. There
-/// is still a check in debug mode so that tests may catch a `null`
-/// value and fail as intended.
-///
-/// # Safety
-/// To call this method safely, `ptr` must be a non-null pointer.
-#[inline(always)]
-unsafe fn bypass_null<T>(ptr: *mut T) -> NonNull<T> {
-    debug_assert!(!ptr.is_null());
-    // SAFETY: A caller following the contract will ensure
-    // that this pointer is not null.
-    unsafe { NonNull::new_unchecked(ptr) }
-}
+
+type HazardAtomicPtr<T> = haphazard::AtomicPtr<T>;
 
 // TODO: Implement finalization properly.
 
@@ -619,48 +708,51 @@ pub fn check_null_align<T>() {
     debug_assert!(null_mut::<T>() as usize % align_of::<T>() == 0);
 }
 
-impl<T> LcsqQueue<T> {
+impl<T: Send + Sync> UnboundedQueueInternal<T> {
     /// Creates a new [LcsqQueue] with a single internal ring.
     pub fn new(segment_order: usize) -> Self {
         let queue = LscqNode::allocate(segment_order);
 
-        let queue_ptr = queue.into_raw().as_ptr();
+        let queue_ptr = queue.as_ptr();
+        // println!("initial {:?}", queue_ptr);
 
         // Check the null alignment of the `LscqNode`.
         check_null_align::<LscqNode<T>>();
         Self {
-            head: AtomicPtr::new(queue_ptr).into(),
-            tail: AtomicPtr::new(queue_ptr).into(),
-            internal_order: segment_order,
-            incin: Incinerator::new(),
+            head: unsafe { HazardAtomicPtr::new(queue_ptr) }.into(),
+            tail: unsafe { HazardAtomicPtr::new(queue_ptr) }.into(),
+            internal_order: segment_order
         }
     }
     /// Enqueues an element of type `T` into the queue.
-    pub fn enqueue(&self, mut element: T)
-    where
-        T: Clone + Debug,
+    pub fn enqueue(&self, hp: &mut HazardPointer<'_>, mut element: T)
     {
         loop {
-            let cq_ptr = self.tail.load(Acquire);
+            let cq_ptr = self.tail.safe_load(hp).unwrap();
+            // let cq_ptr = self.tail.load(Acquire);
             // SAFETY: The tail can never be a null pointer so we can
             // safely dereference. Additionally, there are never any mutabkle
             // pointers to this memory address.
-            let cq = unsafe { &*cq_ptr };
+            // println!("Accessing {cq_ptr:?} (D)");
+            // let cq = unsafe { &*cq_ptr };
 
             // If the next pointer is not null then we want to keep
             // going next until we have found the end.
-            let next_ptr = cq.next.load(Acquire);
+            let next_ptr = cq_ptr.next.load_ptr();
             if !next_ptr.is_null() {
-                let _ = self
+                unsafe {
+                    let _ = self
                     .tail
-                    .compare_exchange(cq_ptr, next_ptr, AcqRel, Acquire);
+                    .compare_exchange_ptr(cq_ptr as *const LscqNode<T> as *mut LscqNode<T>, next_ptr);
+                }
+                
                 yield_marker();
                 continue;
             }
 
             // Attempts to enqueue the item, we should finalize the
             // queue if we can.
-            match cq.value.enqueue_cycle::<true>(element) {
+            match cq_ptr.value.enqueue_cycle::<true>(element) {
                 Ok(_) => {
                     // We are done and have succesfully enqueued the item.
                     return;
@@ -680,20 +772,21 @@ impl<T> LcsqQueue<T> {
                 .enqueue(element)
                 .expect("Freshly allocated queue could not accept one value.");
             // The forget_inner prevents miri from detecting data race?
-            let ncq = OwnedAlloc::new(ncq).forget_inner().into_raw();
+            let ncq = NonNull::from(Box::leak(Box::new(ncq)));
+            // println!("Allocated: {:?}", ncq);
             // std::sync::atomic::compiler_fence(SeqCst);
             // std::sync::atomic::fence(SeqCst);
 
             // Try to insert a new tail into the queue.
-            if cq
+            if unsafe { cq_ptr
                 .next
-                .compare_exchange(null_mut(), ncq.as_ptr(), AcqRel, Acquire)
-                .is_ok()
+                .compare_exchange_ptr(null_mut(), ncq.as_ptr())
+                .is_ok() }
             {
                 // Correct the list ordering.
-                let _ = self
+                let _ = unsafe { self
                     .tail
-                    .compare_exchange(cq_ptr, ncq.as_ptr(), AcqRel, Acquire);
+                    .compare_exchange_ptr(cq_ptr as *const LscqNode<T> as *mut LscqNode<T>, ncq.as_ptr()) };
                 // NOTE: We do not have to free the allocation here
                 // because we haave succesfully put it into the list.
                 return;
@@ -703,7 +796,12 @@ impl<T> LcsqQueue<T> {
             // can avoid clones.
             // SAFETY: This is the only instance of this pointer
             // and it is non-null because we allocated it with `OwnedAlloc`.
-            element = unsafe { ncq.as_ref().value.dequeue().unwrap() };
+            // println!("Accessing {ncq:?} (E)");
+            let Some(value) = (unsafe { ncq.as_ref().value.dequeue() }) else {
+                panic!("Failed to access previously enqueued value.")
+            };
+            element = value;
+            // element = unsafe { ncq.as_ref().value.dequeue().unwrap() };
 
             // SAFETY: The allocation was created with `OwnedAlloc` and we
             // have unique access to it.
@@ -716,27 +814,21 @@ impl<T> LcsqQueue<T> {
     }
     /// Removes an element from the queue returning an [Option]. If the queue
     /// is empty then the returned value will be [Option::None].
-    pub fn dequeue(&self) -> Option<T>
-    where
-        T: Debug + Clone,
+    pub fn dequeue(&self, hp:&mut HazardPointer<'_>, next: &mut HazardPointer  ) -> Option<T>
     {
-        // Since dequeue actually removes nodes, we need to pause the incinerator
-        // for the time being.
-        // println!("Pausing...");
-        let pause = self.incin.pause();
-        // println!("Paused...");
-
         loop {
             // SAFETY: The head node will always be a non-null node.
-            let cq_ptr = unsafe { bypass_null(self.head.load(Acquire)) };
+            // let head_ptr = self.head;
+            let cq_ptr = self.head.safe_load(hp).unwrap();
             // SAFETY: The pointer is non-null and there are only immutable
             // references to it. Additionlly, since it is the head, there are
             // no mutable references to this memory location.
-            let cq = unsafe { &*cq_ptr.as_ptr() };
+            // println!("Accessing {cq_ptr:?} (A)");
+            // let cq = unsafe { &*cq_ptr.as_ptr() };
 
             // Dequeue an entry.
             // println!("Enteirng...");
-            let mut p = cq.value.dequeue();
+            let mut p = cq_ptr.value.dequeue();
             // println!("Existing...");
             if p.is_some() {
                 // The entry actually holds a value, in this case,
@@ -746,125 +838,272 @@ impl<T> LcsqQueue<T> {
 
             // If the next pointer is null then we have nothing
             // to dequeue and thus we can just return [Option::None].
-            if cq.next.load(Acquire).is_null() {
+            if cq_ptr.next.safe_load(next).is_none() {
                 return None;
             }
             // Update the threshold.
-            cq.value
+            cq_ptr.value
                 .alloc_queue
                 .threshold
-                .store(3 * (1 << (cq.value.free_queue.order + 1)) - 1, SeqCst);
+                .store(3 * (1 << (cq_ptr.value.free_queue.order + 1)) - 1, SeqCst);
 
             // Try dequeing again.
-            p = cq.value.dequeue();
+            p = cq_ptr.value.dequeue();
             if p.is_some() {
                 return p;
             }
 
+            
+            if let Ok(mut ok) = unsafe { self.head.compare_exchange_ptr(cq_ptr as *const LscqNode<T> as *mut LscqNode<T>, cq_ptr.next.load_ptr()) } {
+                unsafe { ok.take().unwrap().retire() };
+            }
+
             // Here we remove the SCQ.
             // let cq_ptr = unsafe { NonNull::new_unchecked(self.head.load(Acquire)) };
-            unsafe { self.free_front(cq_ptr, &pause) }?;
+            // unsafe { self.free_front(cq_ptr, &pause) }?;
+            // unsafe { self.head.retire() };
 
             yield_marker();
             // println!("injunctive");
         }
     }
-
-    /// Frees the front of the queue.
-    ///
-    /// # Safety
-    /// For this method to be called safely, front must be a non-null pointer
-    /// and the incinerator must be properly paused.
-    #[inline(always)]
-    unsafe fn free_front(
-        &self,
-        mut front: NonNull<LscqNode<T>>,
-        pause: &Pause<'_, OwnedAlloc<LscqNode<T>>>,
-    ) -> Option<()> {
-        // println!("Entering switch...");
-        loop {
-            // println!("entering free loop...");
-            if unsafe { front.as_ref().is_live.swap(false, AcqRel) } {
-                // We were the ones to kill it, so we can
-                // remove it like this.
-                // SAFETY: The incinerator is paused and the front is a non-null pointer.
-                unsafe { self.try_clear_first(front, pause) };
-                break Some(());
-            } else {
-                // println!("Switching up...");
-                // It is already dead, we can help try to clear it.
-                front = unsafe { self.try_clear_first(front, pause) }?;
-            }
-            // println!("disjunctive...");
-            yield_marker();
-        }
-    }
-    #[inline(always)]
-    /// Replaces the front of the queue with the next node, inserting
-    /// the previous front into the incinerator.
-    ///
-    /// Heavily inspired by the following code from [lockfree]:
-    /// https://gitlab.com/bzim/lockfree/-/blob/master/src/queue.rs?ref_type=heads
-    ///
-    /// SAFETY: For this method to be safe several things must be upheld:
-    /// 1. The nonnull points to a valid non-null pointer allocated by [OwnedAlloc].
-    /// 2. The incinerator is paused.
-    unsafe fn try_clear_first(
-        &self,
-        expected: NonNull<LscqNode<T>>,
-        pause: &Pause<'_, OwnedAlloc<LscqNode<T>>>,
-    ) -> Option<NonNull<LscqNode<T>>> {
-        // SAFETY: There are no mutable references to expected and it
-        // is a non-null pojinter.
-        let next = unsafe { expected.as_ref().next.load(Acquire) };
-
-        // If this is the only node, we will not remove it. We want front and
-        // back to share the same node rather than having to set both to null when
-        // the queue is empty.
-        NonNull::new(next).map(|next_nnptr| {
-            let ptr = expected.as_ptr();
-
-            // This is cleanup-- another thread might do it.
-            match self.head.compare_exchange(ptr, next, Relaxed, Relaxed) {
-                Ok(_) => {
-                    // Delete nodes via incinater to address ABA problem & use-after-frees.
-                    pause.add_to_incin(unsafe { OwnedAlloc::from_raw(expected) });
-                    next_nnptr
-                }
-                Err(found) => {
-                    // Here it is safe to by-pass the check since we only store non-null
-                    // pointers on the front.
-                    unsafe { bypass_null(found) }
-                }
-            }
-        })
-    }
 }
 
-impl<T> Drop for LcsqQueue<T> {
+impl<T> Drop for UnboundedQueueInternal<T> {
+    /// Drops the queue, deallocating all the nodes. Requires
+    /// exclusive access to the queue.
     fn drop(&mut self) {
-        // TODO: Implement the drop.
-
-        let mut next = self.head.load(Acquire);
+        let mut next = self.head.load_ptr();
         while !next.is_null() {
             // SAFETY: If drop is called then we have exclusive access
             // to this strucutture. TODO: Improve docs with inspiration from lockfree crate.
             unsafe {
                 let temp = next;
-                next = (*next).next.load(Acquire);
+                next = (*next).next.load_ptr();
                 free_owned_alloc(temp);
             }
         }
     }
 }
 
-/// Frees memory allocated by an [OwnedAlloc]
+/// A enqueue handle to an [UnboundedQueue], allowing for
+/// bulk enqueues efficiently. Internally, the unbounded queue manages
+/// the queue of bounded queues with hazard pointers to avoid the ABA problem, this
+/// allows minimizing the creation of these hazard pointers.
+/// 
+/// # Example
+/// ```
+/// use lfqueue::UnboundedQueue;
+/// 
+/// let queue = UnboundedQueue::<usize>::new(2);
+/// let mut handle = queue.enqueue_handle();
+/// handle.enqueue(3);
+/// ```
+pub struct UnboundedEnqueueHandle<'a, T> {
+    internal: &'a UnboundedQueueInternal<T>,
+    primary: HazardPointer<'static>
+}
+
+impl<'a, T> UnboundedEnqueueHandle<'a, T>
+where 
+    T: Send + Sync
+{
+    /// Enqueues an item on the underlying queue.
+    /// 
+    /// # Example
+    /// ```
+    /// use lfqueue::{UnboundedEnqueueHandle, UnboundedQueue};
+    /// 
+    /// let queue = UnboundedQueue::<usize>::new(2);
+    /// let mut handle = queue.enqueue_handle();
+    /// handle.enqueue(3);
+    /// ```
+    pub fn enqueue(&mut self, item: T) {
+        self.internal.enqueue(&mut self.primary, item);
+    }
+}
+
+/// A full handle to an [UnboundedQueue], allowing for
+/// bulk enqueues efficiently. Internally, the unbounded queue manages
+/// the queue of bounded queues with hazard pointers to avoid the ABA problem, this
+/// allows minimizing the creation of these hazard pointers.
+/// 
+/// # Example
+/// ```
+/// use lfqueue::UnboundedQueue;
+/// 
+/// let queue = UnboundedQueue::<usize>::new(2);
+/// let mut handle = queue.full_handle();
+/// handle.enqueue(3);
+/// 
+/// assert_eq!(handle.dequeue(), Some(3));
+/// assert!(handle.dequeue().is_none());
+/// ```
+pub struct UnboundedFullHandle<'a, T> {
+    enqueue: UnboundedEnqueueHandle<'a, T>,
+    secondary: HazardPointer<'static>
+}
+
+impl<'a, T> UnboundedFullHandle<'a, T>
+where 
+    T: Send + Sync
+{
+    /// Enqueues an item on the underlying queue.
+    /// 
+    /// # Example
+    /// ```
+    /// use lfqueue::{UnboundedFullHandle, UnboundedQueue};
+    /// 
+    /// let queue = UnboundedQueue::<usize>::new(2);
+    /// let mut handle = queue.full_handle();
+    /// handle.enqueue(3);
+    /// ```
+    pub fn enqueue(&mut self, item: T) {
+        self.enqueue.internal.enqueue(&mut self.enqueue.primary, item);
+    }
+    /// Enqueues an item on the underlying queue.
+    /// 
+    /// # Example
+    /// ```
+    /// use lfqueue::{UnboundedFullHandle, UnboundedQueue};
+    /// 
+    /// let queue = UnboundedQueue::<usize>::new(2);
+    /// let mut handle = queue.full_handle();
+    /// handle.enqueue(3);
+    /// 
+    /// assert_eq!(handle.dequeue(), Some(3));
+    /// ```
+    pub fn dequeue(&mut self) -> Option<T> {
+        self.enqueue.internal.dequeue(&mut self.enqueue.primary, &mut self.secondary)
+    }
+}
+
+
+/// An unbounded lock-free queue. This is the LCSQ from the ACM paper,
+/// "A Scalable, Portable, and Memory-Efficient Lock-Free FIFO Queue" by Ruslan Nikolaev.
+/// 
+/// Internally, it manages a linked list of bounded queue types and this allows it
+/// to grow in an unbounded manner. Since with a reasonable order new queue creation and deletion
+/// should be sparse, the operation cost is largely dominated by the internal queues and thus is still
+/// extremely fast.
+/// 
+/// # Example
+/// ```
+/// use lfqueue::UnboundedQueue;
+/// 
+/// let queue = UnboundedQueue::<usize>::new(2);
+/// queue.enqueue(4);
+/// queue.enqueue(5);
+/// 
+/// assert_eq!(queue.dequeue(), Some(4));
+/// assert_eq!(queue.dequeue(), Some(5));
+/// ```
+pub struct UnboundedQueue<T> {
+    internal: UnboundedQueueInternal<T>,
+    order: usize
+}
+
+unsafe impl<T: Send + Sync> Send for UnboundedQueue<T> {}
+unsafe impl<T: Send + Sync> Sync for UnboundedQueue<T> {}
+
+impl<T> UnboundedQueue<T>
+where 
+    T: Send + Sync
+{
+    /// Creates a new [UnboundedQueue] with an initial ring order of `order`. This means
+    /// each queue segment has a size of 2 ^ order.
+    /// 
+    /// # Examples
+    /// ```
+    /// use lfqueue::UnboundedQueue;
+    /// 
+    /// let queue = UnboundedQueue::<()>::new(2);
+    /// assert_eq!(queue.base_segment_capacity(), 4);
+    /// ```
+    pub fn new(order: usize) -> Self {
+        Self {
+            internal: UnboundedQueueInternal::new(order),
+            order
+        }
+    }
+    /// Returns the base segment capacity of the [UnboundedQueue], this is the
+    /// capacity of the base ring. Or in other words, 2 ^ order.
+    /// 
+    /// # Examples 
+    /// ```
+    /// use lfqueue::UnboundedQueue;
+    /// 
+    /// let queue = UnboundedQueue::<()>::new(2);
+    /// assert_eq!(queue.base_segment_capacity(), 4);
+    /// ```
+    pub fn base_segment_capacity(&self) -> usize {
+        1 << self.order
+    }
+    /// Creates an [UnboundedEnqueueHandle] that allows for the execution of
+    /// many 
+    /// 
+    /// # Example
+    /// ```
+    /// use lfqueue::{UnboundedEnqueueHandle, UnboundedQueue};
+    /// 
+    /// let queue = UnboundedQueue::<usize>::new(2);
+    /// let mut handle = queue.enqueue_handle();
+    /// handle.enqueue(3);
+    /// handle.enqueue(4);
+    /// ```
+    pub fn enqueue_handle(&self) -> UnboundedEnqueueHandle<'_, T> {
+        UnboundedEnqueueHandle {
+            internal: &self.internal,
+            primary: HazardPointer::new()
+        }
+    }
+    pub fn full_handle(&self) -> UnboundedFullHandle<'_, T> {
+        UnboundedFullHandle { enqueue: self.enqueue_handle(), secondary: HazardPointer::new() }
+    }
+    /// Enqueues a single entry. Internally, this just creates an [UnboundedEnqueueHandle] and
+    /// performs a single enqueue operation. If you intend to do several enqueues in a row, please
+    /// see [UnboundedQueue::enqueue_handle].
+    /// 
+    /// # Example
+    /// ```
+    /// use lfqueue::UnboundedQueue;
+    /// 
+    /// let queue = UnboundedQueue::<usize>::new(2);
+    /// queue.enqueue(4);
+    /// ```
+    pub fn enqueue(&self, item: T)
+    {
+        self.enqueue_handle().enqueue(item);
+    }
+
+    /// Dequeues a single entry. Internally, this just creates an [UnboundedFullHandle] and performs
+    /// a single dequeue operation. If you intend to do several dequeues in a row, please see
+    /// [UnboundedQueue::full_handle].
+    /// 
+    /// # Example
+    /// ```
+    /// use lfqueue::UnboundedQueue;
+    /// 
+    /// let queue = UnboundedQueue::<usize>::new(2);
+    /// queue.enqueue(2);
+    /// 
+    /// assert_eq!(queue.dequeue(), Some(2));
+    /// ```
+    pub fn dequeue(&self) -> Option<T>
+    {
+       self.full_handle().dequeue()
+    }
+}
+
+/// Frees memory allocated by an [Box]. This uses manual ma
 ///
 /// # Safety
-/// This ptr must have been produced with [OwnedAlloc::into_raw] and represent
+/// This ptr must have been produced with [Box::leak] and represent
 /// a valid pointer to initialized memory.
 unsafe fn free_owned_alloc<T>(ptr: *mut T) {
-    unsafe { OwnedAlloc::from_raw(NonNull::new_unchecked(ptr)) };
+    // SAFETY: The pointer is non-null and represents a valid
+    // pointer to initialized memory and was constructed via a box allocation.
+    drop(unsafe { Box::from_raw(ptr)  });
 }
 
 #[cfg(test)]
@@ -874,8 +1113,7 @@ mod tests {
     use lockfree::queue;
 
     use crate::scq::{
-        LcsqQueue, ScqError, ScqQueue, ScqRing,
-        lfring_signed_cmp,
+        lfring_signed_cmp, AllocBoundedQueue, BoundedQueue, ScqError, ScqRing, UnboundedQueue
     };
 
     #[cfg(loom)]
@@ -1017,8 +1255,11 @@ mod tests {
     pub fn lcsq_circus() {
         use std::sync::{Arc, Barrier};
 
-        let context = Arc::new(ScqQueue::new(3));
+        use crate::scq::AllocBoundedQueue;
 
+        let context = Arc::new(AllocBoundedQueue::new(3));
+        loop {
+            
         let threads = 50;
         let thread_runs = 100;
 
@@ -1054,6 +1295,8 @@ mod tests {
         for handle in handles {
             handle.join().unwrap();
         }
+        break;
+        }
 
         // barrier_finalized.wait();
         // println!("Done");
@@ -1064,7 +1307,7 @@ mod tests {
     pub fn verify_small_queue_correctness() {
 
         fn queue_harness( order: usize) {
-            let queue = ScqQueue::new(order);
+            let queue = AllocBoundedQueue::new(order);
             assert_eq!(queue.capacity(), 1 << order);
             for i in 0..queue.capacity() {
                 queue.enqueue(i).unwrap();
@@ -1089,8 +1332,21 @@ mod tests {
 
     #[test]
     #[cfg(not(loom))]
+    pub fn test_const_queue() {
+        use crate::ConstBoundedQueue;
+
+        let queue = ConstBoundedQueue::<usize, 4>::new_const_queue();
+        assert!(queue.enqueue(1).is_ok());
+        assert!(queue.enqueue(2).is_ok());
+        assert_eq!(queue.enqueue(3), Err(ScqError::QueueFull));
+        panic!("hello: {}", queue.capacity());
+
+    }
+
+    #[test]
+    #[cfg(not(loom))]
     pub fn check_scq_fill() {
-        let mut fill = ScqQueue::new(3);
+        let mut fill = AllocBoundedQueue::new(3);
         for i in 0..8 {
             fill.enqueue(i).unwrap();
         }
@@ -1114,17 +1370,18 @@ mod tests {
     #[cfg(not(loom))]
     #[test]
     pub fn test_lcsq_ptr() {
-        let ring = LcsqQueue::new(3);
+        let ring = UnboundedQueue::new(3);
         for i in 0..16 {
             ring.enqueue(i);
         }
 
-        println!("RING: {:?}", ring);
+        // println!("RING: {:?}", ring);
 
-        for _ in 0..16 {
-            println!("HELLO: {:?}", ring.dequeue());
+        for i in 0..16 {
+            assert_eq!(ring.dequeue(), Some(i));
+            // println!("HELLO: {:?}", ring.dequeue());
         }
-        println!("HELLO: {:?}", ring.dequeue());
+        // println!("HELLO: {:?}", ring.dequeue());
     }
 
     #[cfg(not(loom))]
@@ -1133,10 +1390,10 @@ mod tests {
         let ring = ScqRing::<false>::new(3);
         assert_eq!(ring.capacity(), 8);
 
-        println!(
-            "Threshold: {}",
-            ring.threshold.load(std::sync::atomic::Ordering::SeqCst)
-        );
+        // println!(
+        //     "Threshold: {}",
+        //     ring.threshold.load(std::sync::atomic::Ordering::SeqCst)
+        // );
 
         ring.enqueue(3).unwrap();
         println!(
@@ -1162,7 +1419,7 @@ mod tests {
     #[cfg(not(loom))]
     #[test]
     pub fn scqqueue_enq_deq() -> Result<(), ScqError> {
-        let holder = ScqQueue::new(3);
+        let holder = AllocBoundedQueue::new(3);
         holder.enqueue("A")?;
         holder.enqueue("B")?;
         println!("Enqueued items.");
@@ -1186,7 +1443,7 @@ mod tests {
         // println!("Value: {:?}", ring);
         // assert_eq!(ring.dequeue(), Some(0x22cf301a020));
 
-        let holder: ScqQueue<&str, false> = ScqQueue::new(3);
+        let holder: AllocBoundedQueue<&str> = AllocBoundedQueue::new(3);
         println!("Holder: {:?}", holder);
         for _ in 0..holder.alloc_queue.capacity() {
             holder.enqueue("A").unwrap();

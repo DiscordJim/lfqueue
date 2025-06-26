@@ -1,5 +1,5 @@
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
-use lfqueue::{LcsqQueue, ScqQueue};
+use lfqueue::{AllocBoundedQueue, BoundedQueue, UnboundedQueue};
 use std::collections::VecDeque;
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::Instant;
@@ -126,7 +126,7 @@ fn bench_lscq_queue(c: &mut Criterion) {
         c,
         "scqring",
         PARAM_CONFIGS,
-        || ScqQueue::new(4),
+        || AllocBoundedQueue::new(4),
         |queue, item|  {
             let _ = queue.enqueue(item);
         },

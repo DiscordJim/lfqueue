@@ -1,7 +1,7 @@
 #![no_main]
 
 use arbitrary::*;
-use lfqueue::{GrindInstr, MockQueue, LcsqQueue, configure_grind};
+use lfqueue::{GrindInstr, MockQueue, UnboundedQueue, configure_grind};
 use libfuzzer_sys::fuzz_target;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -13,10 +13,11 @@ pub fn random_range(data: &mut Unstructured, min: usize, max: usize) -> usize {
 }
 
 fuzz_target!(|data: &[u8]| {
+    // println!("\n\nStart Test...");
     let mut uns = Unstructured::new(data);
 
     let grind = configure_grind(&mut uns);
-    let mut queue = Arc::new(LcsqQueue::<usize>::new(grind.order));
+    let mut queue = Arc::new(UnboundedQueue::<usize>::new(grind.order));
 
     let mut handles = vec![];
 

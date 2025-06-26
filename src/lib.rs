@@ -1,8 +1,14 @@
 mod scq;
 
-pub use scq::ScqQueue;
+pub use scq::BoundedQueue;
 pub use scq::ScqError;
-pub use scq::LcsqQueue;
+pub use scq::UnboundedQueue;
+pub use scq::UnboundedEnqueueHandle;
+pub use scq::UnboundedFullHandle;
+pub use scq::AllocBoundedQueue;
+pub use scq::ConstBoundedQueue;
+
+
 #[cfg(fuzzing)]
 pub use scq::ScqRing;
 

@@ -223,6 +223,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "haphazard"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eecbf466a0aaa1c1e1ac0b08d5a603617fdb543f15c82fc331701bf1f5c05c36"
+dependencies = [
+ "loom",
+]
+
+[[package]]
 name = "itertools"
 version = "0.10.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -269,9 +278,9 @@ dependencies = [
  "arbitrary",
  "criterion",
  "crossbeam-utils",
+ "haphazard",
  "lockfree",
  "loom",
- "owned-alloc",
 ]
 
 [[package]]

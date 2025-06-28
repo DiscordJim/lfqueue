@@ -13,17 +13,25 @@ arbitrary = { version = "1.4.1", features = ["derive"] }
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(fuzzing)'] }
 
-
+[features]
+default = [ "std" ]
+std = [ "haphazard" ]
+portable-atomic = [ "dep:portable-atomic" ]
 
 [dependencies]
-crossbeam-utils = "0.8.21"
-haphazard = "0.1.8"
+crossbeam-utils = { version = "0.8.21", default-features = false }
+haphazard = { version = "0.1.8", optional = true }
+portable-atomic = { version = "1.11.1", optional = true }
 
 [dev-dependencies]
 arbitrary = { version = "1.4.1", features = ["derive"] }
 criterion = "0.6.0"
+crossbeam-queue = "0.3.12"
 lockfree = "0.5.1"
+rand = "0.9.1"
 
 [[bench]]
 name = "syncqueue"
 harness = false
+required-features = ["std"] # this is the new property
+

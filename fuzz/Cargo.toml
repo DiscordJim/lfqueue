@@ -4,15 +4,18 @@ version = "0.0.0"
 publish = false
 edition = "2024"
 
+
 [package.metadata]
 cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1.4.1", features = ["derive"] }
+haphazard = { version = "0.1.8" }
 
 [dependencies.lfqueue]
 path = ".."
+features = [ "std" ]
 
 [[bin]]
 name = "fuzz_target_1"
@@ -67,6 +70,13 @@ bench = false
 [[bin]]
 name = "lscq_grind_rt"
 path = "fuzz_targets/lscq_grind_rt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "const_grind"
+path = "fuzz_targets/const_grind.rs"
 test = false
 doc = false
 bench = false

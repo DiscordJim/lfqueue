@@ -1,91 +1,159 @@
-// //! An implementation of the lock-free queue
-// //! from "[PAPER NAME HERE]"
-// //!
-// //!
-// //! https://github.com/rusnikola/lfqueue/blob/master/lfring_cas1.h
-// use std::sync::atomic::{AtomicIsize, AtomicUsize};
+use crate::atomics::{AtomicBool, AtomicIsize, AtomicUsize};
+use core::cell::UnsafeCell;
+use core::cmp;
+use core::fmt::Debug;
+use core::marker::PhantomData;
+use core::sync::atomic::Ordering::*;
+use crossbeam_utils::{Backoff, CachePadded};
 
-use std::cell::UnsafeCell;
-use std::fmt::Debug;
-use std::marker::PhantomData;
-use std::ptr::{NonNull, null_mut};
-use std::{cmp};
+/// A constant generic [ScqRing] that does not use the heap to allocate
+/// itself.
+type ConstScqRing<const MODE: bool, const N: usize> = ScqRing<[CachePadded<AtomicUsize>; N], MODE>;
 
-use haphazard::HazardPointer;
-#[cfg(loom)]
-use loom::sync::atomic::{AtomicBool, AtomicIsize, AtomicPtr, AtomicUsize, Ordering::*};
+/// The cache padded atomic type used for ring arrays.
+type PaddedAtomics = [CachePadded<AtomicUsize>];
 
-#[cfg(not(loom))]
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering::*};
+impl<T, const N: usize> private::Sealed for [UnsafeCell<Option<T>>; N] {}
+impl<const N: usize> private::Sealed for [CachePadded<AtomicUsize>; N] {}
 
-use crossbeam_utils::CachePadded;
-
-
-
-
-#[derive(Debug)]
-pub struct ScqRing<const MODE: bool> {
-    is_finalized: CachePadded<AtomicBool>,
-    head: CachePadded<AtomicUsize>,
-    tail: CachePadded<AtomicUsize>,
-    threshold: CachePadded<AtomicIsize>,
-    array: Box<[CachePadded<AtomicUsize>]>,
-    order: usize,
+#[inline(always)]
+pub(crate) fn determine_order(length: usize) -> usize {
+    assert!((length % 2 == 0) || length == 1, "Length must be a multiple of two.");
+    let Some(value) = length.checked_ilog2() else {
+        panic!("could not take log2 of length: {length}. Is it a power of two?");
+    };
+    value as usize
 }
 
+#[inline(always)]
+pub(crate) const fn determine_order_const(length: usize) -> usize {
+    assert!((length % 2 == 0) || length == 1, "Length must be a multiple of two.");
+    let Some(value) = length.checked_ilog2() else {
+        panic!("could not take log2 of length. Is it a power of two?");
+    };
+    value as usize - 1
+}
 
-impl<const MODE: bool> PartialEq for ScqRing<MODE> {
+/// The actual SCQ ring from the ACM paper. This only stores indices, and will
+/// corrupt indices above a certain value. There is an error check to prevent this from
+/// occuring.
+///
+/// # Generics
+/// - `MODE` expresses the mode of the ring and enables compiler optimizaiton. It only has two
+/// valid values, `0` and `1`. If it is `0`, the ring is not finalizable and this field will be optimized
+/// out by the compiler. If it is `1` then the ring is finalizable and this field will not be optimized out
+/// by the compiler.
+#[derive(Debug)]
+pub struct ScqRing<I, const MODE: usize> {
+    /// Is the ring finalized? This tells us if we can insert more entries. This
+    /// field is not used unless we are using it as part of an actual unbounded queue.
+    ///
+    /// The reason *why* this is a generic is explained in the struct documentation.
+    pub(crate) is_finalized: [CachePadded<AtomicBool>; MODE],
+    /// The head of the ring.
+    pub(crate) head: CachePadded<AtomicUsize>,
+    /// The tail of the ring.
+    pub(crate) tail: CachePadded<AtomicUsize>,
+    /// The threshold value, described in the ACM paper.
+    pub(crate) threshold: CachePadded<AtomicIsize>,
+    /// The backing array. This has strict contraints and cna only
+    /// be one of two types.
+    pub(crate) array: I,
+    /// The order of the ring.
+    pub(crate) order: usize,
+}
+
+impl<I, const MODE: usize> PartialEq for ScqRing<I, MODE>
+where
+    I: AsRef<PaddedAtomics> + private::Sealed,
+{
+    /// Checks if two [ScqRing] are identical.
     fn eq(&self, other: &Self) -> bool {
-        self.is_finalized.load(Relaxed) == other.is_finalized.load(Relaxed)
+        ((self.is_finalized.len() == other.is_finalized.len())
+            && !(self.is_finalized.len() > 0
+                && self.is_finalized[0].load(Relaxed) != other.is_finalized[0].load(Relaxed)))
             && self.head.load(Relaxed) == other.head.load(Relaxed)
             && self.tail.load(Relaxed) == other.tail.load(Relaxed)
             && self.threshold.load(Relaxed) == other.threshold.load(Relaxed)
             && self.order == other.order
             && self
                 .array
+                .as_ref()
                 .iter()
-                .zip(other.array.iter())
+                .zip(other.array.as_ref().iter())
                 .all(|(a, b)| a.load(Relaxed) == b.load(Relaxed))
     }
 }
 
-impl<const MODE: bool> Eq for ScqRing<MODE> {}
+impl<I, const MODE: usize> Eq for ScqRing<I, MODE> where I: AsRef<PaddedAtomics> + private::Sealed {}
 
 #[inline(always)]
-fn lfring_threshold3(half: usize, n: usize) -> usize {
-    (half) + (n) - 1
+pub(crate) fn lfring_threshold3(half: usize, n: usize) -> usize {
+    half + n - 1
 }
 
+/// Calculates 2 ^ order.
 #[inline(always)]
-fn lfring_pow2(order: usize) -> usize {
+pub(crate) fn lfring_pow2(order: usize) -> usize {
     1usize << order
 }
 
 #[inline(always)]
-fn modup(value: usize, n: usize) -> usize {
-    value | (2 * n - 1)
+pub(crate) fn modup(value: usize, n: usize) -> usize {
+    value | ((n << 1) - 1)
 }
 
+/// Performs a signed comparison function, this is emulating a function
+/// from the `C` code implementation and performs a signed comparison by casting
+/// the two [usize] values to [usize], performing a comparison and then returning
+/// the [cmp::Ordering.]
 #[inline(always)]
-fn lfring_signed_cmp(a: usize, b: usize) -> cmp::Ordering {
+pub(crate) fn lfring_signed_cmp(a: usize, b: usize) -> cmp::Ordering {
     ((a as isize) - (b as isize)).cmp(&0)
 }
 
-type AtomicIndexArray = Box<[CachePadded<AtomicUsize>]>;
-
-struct ScqAlloc {
-    tail: usize,
-    thresh: isize,
-    array: AtomicIndexArray,
+/// Represents the allocation details of an [ScqRing]. The `I` type may
+/// be used to differentiate between allocated (heap) and const generic rings for
+/// storage reasons so that this can be used in a no-std environment.
+pub(crate) struct ScqAlloc<I> {
+    /// The backing buffer to use.
+    pub(crate) array: I,
+    /// Where the tail should start.
+    pub(crate) tail: usize,
+    /// Where the threshold should tart.
+    pub(crate) thresh: isize,
 }
 
-fn allocate_atomic_array_empty(order: usize) -> ScqAlloc {
-    let n = lfring_pow2(order + 1);
-    let array = (0..n)
-        .map(|_| AtomicUsize::new((-1isize) as usize))
-        .map(CachePadded::new)
-        .collect::<Vec<_>>()
-        .into_boxed_slice();
+/// Initializes a full SCQ ring. This is a convienence method
+/// that allows initlizing the ring with all the entries populated
+/// instead of intitializing the ring and then performing costly
+/// enqueue operations.
+#[inline]
+pub(crate) fn initialize_atomic_array_full<I>(buffer: &I, half: usize, n: usize)
+where
+    I: AsRef<[CachePadded<AtomicUsize>]>,
+{
+    let buffer = buffer.as_ref();
+    let mut i = 0;
+
+    // Initialize the part of the array that is actually filled, this
+    // contains the actual values.
+    while i != half {
+        buffer[lfring_map(i, n)].store(n + lfring_map(i, half), Relaxed);
+        i += 1;
+    }
+
+    // Intitialize the rest of the array.
+    while i != n {
+        buffer[lfring_map(i, n)].store(-1isize as usize, Relaxed);
+        i += 1;
+    }
+}
+
+/// Creates a new full array of [AtomicUsize] of size `N` with cache padding.
+#[inline]
+fn create_const_atomic_array_empty<const N: usize>() -> ScqAlloc<[CachePadded<AtomicUsize>; N]> {
+    let array = core::array::from_fn(|_| CachePadded::new(AtomicUsize::new((-1isize) as usize)));
     ScqAlloc {
         array,
         tail: 0,
@@ -93,84 +161,58 @@ fn allocate_atomic_array_empty(order: usize) -> ScqAlloc {
     }
 }
 
-fn allocate_atomic_array_full(order: usize) -> ScqAlloc {
-    let half = lfring_pow2(order);
-    let n = half * 2;
+/// Creates a new full array of [AtomicUsize] of size `N` with cache padding.
+#[inline]
+fn create_const_atomic_array_full<const N: usize>() -> ScqAlloc<[CachePadded<AtomicUsize>; N]> {
+    let array = core::array::from_fn(|_| CachePadded::new(AtomicUsize::new((-1isize) as usize)));
 
-    // Initialize an array of
-    let mut vector = Vec::with_capacity(n);
-    vector.reserve_exact(n);
-    for _ in 0..n {
-        vector.push(CachePadded::new(AtomicUsize::new(-1isize as usize)));
-    }
+    let n = const { N };
+    let half = n >> 1;
 
-    // let array = (0..n)
-    //     .map(|_| AtomicUsize::new((-1isize) as usize))
-    //     .map(CachePadded::new)
-    //     .collect::<Vec<_>>()
-    //     .into_boxed_slice();
-
-    let mut i = 0;
-    while i != half {
-        vector[lfring_map(i, n)].store(n + lfring_map(i, half), Relaxed);
-        i += 1;
-    }
-
-    while i != n {
-        vector[lfring_map(i, n)].store(-1isize as usize, Relaxed);
-        i += 1;
-    }
-
-    // while i != n {
-    //     array[lfring_map(i, order, n)].store(-1isize as usize, Relaxed);
-    //     i += 1;
-    // }
+    initialize_atomic_array_full(&array, half, n);
 
     ScqAlloc {
-        array: vector
-            .into_iter()
-            .collect::<Vec<_>>()
-            .into_boxed_slice(),
+        array,
         tail: half,
         thresh: lfring_threshold3(half, n) as isize,
     }
 }
 
-// fn allocate_atomic_array_fill_linear(order: usize) -> ScqAlloc {
-//     let half = lfring_pow2(order);
-//     let n = half * 2;
-
-//     ScqAlloc {
-//         thresh: half,
-//         array:
-//     }
-
-// }
-
-
-
-
-impl<const MODE: bool> ScqRing<MODE> {
-    pub fn new(order: usize) -> Self {
-        let array = allocate_atomic_array_empty(order);
-        Self::new_from_sqalloc(order, array)
+impl<const MODE: usize, const N: usize> ConstScqRing<MODE, N> {
+    /// Creates a new constant ring that is empty.
+    pub fn new_const_ring_empty() -> Self {
+        // println!("made queue of size: {}", (const { N } >> 1) - 1);
+        Self::new_from_sqalloc(determine_order_const(N), create_const_atomic_array_empty())
     }
-    pub fn new_full(order: usize) -> Self {
-        let array = allocate_atomic_array_full(order);
-        Self::new_from_sqalloc(order, array)
+    /// Creates a new constant ring that is full.
+    pub fn new_const_ring_full() -> Self {
+        Self::new_from_sqalloc(determine_order_const(N), create_const_atomic_array_full())
     }
-    fn new_from_sqalloc(
+}
+
+impl<I, const MODE: usize> ScqRing<I, MODE>
+where
+    I: AsRef<[CachePadded<AtomicUsize>]> + private::Sealed,
+{
+    /// Creates a new [ScqRing] from an [ScqAlloc]. This is a helper
+    /// function so implementations of [ScqRing] with different types of backing
+    /// arrays can be used correctly.
+    pub(crate) fn new_from_sqalloc(
         order: usize,
         ScqAlloc {
             tail,
             thresh,
             array,
-        }: ScqAlloc,
+        }: ScqAlloc<I>,
     ) -> Self {
-        
-        // assert!(order >= 1, "Order must at least be three.");
+        // This method is private, so this assertion is a debug insertion
+        // because this will be correctly handled by the structs that use
+        // the ring.
+        debug_assert!(MODE <= 1, "The mode must be either 0 or 1.");
+
         Self {
-            is_finalized: CachePadded::new(AtomicBool::new(false)),
+            // When the ring is not finalizable, the compiler will optimize out this instruction.
+            is_finalized: core::array::from_fn(|_| CachePadded::new(AtomicBool::new(false))),
             head: CachePadded::new(AtomicUsize::new(0)),
             tail: CachePadded::new(AtomicUsize::new(tail)),
             threshold: CachePadded::new(AtomicIsize::new(thresh)),
@@ -178,74 +220,76 @@ impl<const MODE: bool> ScqRing<MODE> {
             order,
         }
     }
-
     /// Finalizes the [ScqRing] so no more elements may be stored.
+    /// If MODE != 1, this is a no-op.
+    #[inline(always)]
     fn finalize(&self) {
-        if const { !MODE } {
-            panic!("Called finalize() on a non-finalizable ring.");
+        if const { MODE == 1 } {
+            // SAFETY: We just checked that MODE == 1, thus the array has a
+            // size of 1 and there is no point in repeating the index check here.
+            unsafe { self.is_finalized.get_unchecked(0) }.store(true, Release);
+        } else {
+            // If we are in debug mode, to be thorough, let's throw an exception here.
+            debug_assert!(const { MODE == 1 }, "Called finalize() on a non-finalizable ring.");
         }
-        self.is_finalized.store(true, Release);
     }
-    // Tail: 0, Tcycle: 15, Tidx: 0, entry: -1
+    /// Enqueues an index in the ring. The index must be less than 1 << order or
+    /// else it could be corrupted as a modulo operation.
     pub fn enqueue(&self, mut eidx: usize) -> Result<(), ScqError> {
         if eidx >= self.capacity() {
             // The index would be corrupted here.
             return Err(ScqError::IndexLargerThanOrder);
         }
 
-        // println!("Self: {}", self.threshold.load(SeqCst));
+        let backff = Backoff::new();
 
+        // Calculate `n` and `half`.
         let half = lfring_pow2(self.order);
-        let n = half * 2;
+        let n = half << 1;
 
-        // Modulo the value.
-        // println!("ORIGINAL EIDX: {eidx}, {}", n - 1);
+        // Perform a modulo by `N`.
         eidx ^= n - 1;
 
-        // println!("EIDX: {}, N: {}", eidx, n);
-
+    
         loop {
+            // Load the tail.
             let tail = self.tail.fetch_add(1, AcqRel);
             let tcycle = modup(tail << 1, n);
             let tidx = lfring_map(tail, n);
-            // let mut entry = self.array[tidx].value.load(Acquire);
-
-            // println!("Tail: {tail}, TCycle: {tcycle}, TIDX: {tidx}, Entry: {entry}");
-
+          
             'retry: loop {
-                let entry = self.array[tidx].load(Acquire);
-
-                // println!("Entering retry... {}", sel);
+                // Load the entry, calculate the ecycle.
+                let entry = self.array.as_ref()[tidx].load(Acquire);
                 let ecycle = modup(entry, n);
-                // let ecycle = entry | (2 * n - 1);
-                // println!("ECycle: {}", ecycle as isize);
-
-                //   exit(1);
-                // println!("Entry: {}, Ecycle: {}", entry as isize, ecycle as isize);
-
+              
                 if (lfring_signed_cmp(ecycle, tcycle).is_lt())
                     && ((entry == ecycle)
                         || ((entry == (ecycle ^ n))
                             && lfring_signed_cmp(self.head.load(Acquire), tail).is_le()))
                 {
-                    if const { MODE } {
-                        // Check the finalization, we want this to be compiled conditionally.
-                        if self.is_finalized.load(Acquire) {
+                    // If this is a finalizable ring, we will proceed to finalize it.
+                    // This is done with constants to encourage the compiler to optimize
+                    // out the operation if we are working with a bounded array.
+                    if const { MODE == 1 } {
+                        // SAFETY: This is a generic array, and we have just checked the length by verifying the mode.
+                        // Therefore it is safe to access this index.
+                        if unsafe { self.is_finalized.get_unchecked(0) }.load(Acquire) {
                             return Err(ScqError::QueueFinalized);
                         }
                     }
-                    
 
-                    if self.array[tidx]
-                        
+                    // Try to insert the entry.
+                    if self.array.as_ref()[tidx]
                         .compare_exchange_weak(entry, tcycle ^ eidx, AcqRel, Acquire)
                         .is_err()
                     {
                         yield_marker();
-                        // println!("Spinning here...");
+                        backff.spin();
                         continue 'retry;
                     }
 
+                    // Update the threshold.
+                    // FUTURE: Does this need SeqCst ordering?
                     let threshold = lfring_threshold3(half, n) as isize;
                     if self.threshold.load(SeqCst) != threshold {
                         self.threshold.store(threshold, SeqCst);
@@ -256,23 +300,16 @@ impl<const MODE: bool> ScqRing<MODE> {
                     break;
                 }
             }
-            // return Err(ScqError::QueueFull);
-            // println!("loop c");
+            backff.snooze();
             yield_marker();
-
-            // println!("Trigger");
-
-            // println!("Entry: {}, Tcycle: {}", entry as isize, tcycle as isize);
-            // println!("traj");
-
-            // NOTE: We can return here as this generally only fails if it is empty, but this is not universally
-            // true.
-            // return Err(ScqError::QueueFull);
         }
     }
+    /// Returns the capacity of the ring. This is 2 ^ order.
+    #[inline]
     pub fn capacity(&self) -> usize {
         1 << (self.order)
     }
+    /// Catches the tail up with the head.
     fn catchup(&self, mut tail: usize, mut head: usize) {
         while self
             .tail
@@ -286,34 +323,37 @@ impl<const MODE: bool> ScqRing<MODE> {
             }
         }
     }
+    /// Dequeues an index from the [ScqRing].
     pub fn dequeue(&self) -> Option<usize> {
-        let n = 1 << (self.order + 1);
+        let n = lfring_pow2(self.order + 1);
 
+        // Check the threshold and if we are empty, if we
+        // are less than zero then it must be zero.
         if self.threshold.load(SeqCst) < 0 {
             return None;
         }
 
+        let backoff = Backoff::new();
+
         let mut entry_new;
 
         loop {
+            // Load the head.
             let head = self.head.fetch_add(1, AcqRel);
             let hcycle = modup(head << 1, n);
             let hidx = lfring_map(head, n);
             let mut attempt = 0;
-            // println!("Entering dequeue loop...");
 
             'again: loop {
-                // START DO
                 loop {
-                    let entry = self.array[hidx].load(Acquire);
-
-                    // println!("Retry loop...");
+                    // Load the entry and calculate the cycle of the entry.
+                    let entry = self.array.as_ref()[hidx].load(Acquire);
                     let ecycle = modup(entry, n);
-                    // println!("Ecycle: {}, Hcycle: {}", ecycle, hcycle);
+
+
                     if ecycle == hcycle {
-                        // NOTE: IN THE SOURCE THIS IS n - 1s
-                        self.array[hidx].fetch_or(n - 1, AcqRel);
-                        // println!("Dentry: {entry}, Ecycle: {ecycle}, Hidx: {hidx}, Head: {head}, Hcycle: {hcycle}");
+                        // The cycle is the same, remove the entry.
+                        self.array.as_ref()[hidx].fetch_or(n - 1, AcqRel);
                         return Some(entry & (n - 1));
                     }
 
@@ -326,34 +366,34 @@ impl<const MODE: bool> ScqRing<MODE> {
                         attempt += 1;
                         if attempt <= 10 {
                             yield_marker();
-                            // println!("Looping here...");
+                            backoff.spin();
                             continue 'again;
                         }
-                        // println!("John");
                         entry_new = hcycle ^ ((!entry) & n);
                     }
 
+                    // Try to swap out the entry.
                     if !(lfring_signed_cmp(ecycle, hcycle).is_lt()
-                        && self.array[hidx]
-                            
+                        && self.array.as_ref()[hidx]
                             .compare_exchange_weak(entry, entry_new, AcqRel, Acquire)
                             .is_err())
                     {
                         break;
                     }
 
-                    // println!("Loop B");
+
+                    backoff.snooze();
                     yield_marker();
                 }
-                // END DO
                 break;
             }
 
+            
+            // Check update the tail & threshold.
             let tail = self.tail.load(Acquire);
             if lfring_signed_cmp(tail, head + 1).is_le() {
                 self.catchup(tail, head + 1);
                 self.threshold.fetch_sub(1, AcqRel);
-                // println!("Exiting out of branch here...");
                 return None;
             }
 
@@ -361,11 +401,9 @@ impl<const MODE: bool> ScqRing<MODE> {
                 return None;
             }
 
-            // println!("Loop C");
             yield_marker();
         }
     }
-   
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -379,173 +417,201 @@ pub enum ScqError {
     QueueFinalized,
 }
 
-mod private {
+impl core::fmt::Display for ScqError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::IndexLargerThanOrder => "IndexLargerThanOrder",
+            Self::QueueFinalized => "QueueFinalized",
+            Self::QueueFull => "QueueFull"
+        })
+    }
+}
+
+impl core::error::Error for ScqError {
+    fn cause(&self) -> Option<&dyn core::error::Error> {
+        None
+    }
+    fn description(&self) -> &str {
+        match self {
+            Self::IndexLargerThanOrder => "The entry provided was greater or equal than 2 ^ order.",
+            Self::QueueFinalized => "Attempted to insert an entry but the queue was finalized.",
+            Self::QueueFull => "The queue is full of elements."
+        }
+    }
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        None
+    }
+}
+
+pub(crate) mod private {
     pub trait Sealed {}
 }
-
-
-/// A trait that represents a type.
-pub unsafe trait IsolatedSlotable: private::Sealed {
-    type Type;
-
-    fn new(order: usize) -> Self;
-    unsafe fn unique_index(&self, index: usize) -> *mut Option<Self::Type>;
-
+#[inline(always)]
+pub(crate) fn yield_marker() {
+    // std::thread::yield_now();
+    #[cfg(loom)]
+    loom::thread::yield_now();
 }
 
+
+/// The bounded queue type from the ACM paper. This uses
+/// two SCQ rings internally, one that keeps track of free indices
+/// and the other that keeps track of the allocated indices.
 #[derive(Debug)]
-pub struct BoundedQueue<T, I, const SEAL: bool> {
-    backing: I,
-    free_queue: ScqRing<SEAL>,
-    alloc_queue: ScqRing<SEAL>,
-    used: CachePadded<AtomicUsize>,
-    _type: PhantomData<T>,
+pub struct BoundedQueue<T, I, RING, const SEAL: usize>
+where 
+    I: private::Sealed
+{
+    /// The backing array that keeps track of all the slots.
+    pub(crate) backing: I,
+    /// The queue that tracks all the free indices.
+    pub(crate) free_queue: ScqRing<RING, SEAL>,
+    /// The queue that tracks all the allocated indices.
+    pub(crate) alloc_queue: ScqRing<RING, SEAL>,
+    /// How many slots have been used up.
+    pub(crate) used: CachePadded<AtomicUsize>,
+    /// The actual type that the backing array will be storing.
+    pub(crate) _type: PhantomData<T>,
 }
 
-
-unsafe impl<T: Send + Sync, I: IsolatedSlotable, const S: bool> Send for BoundedQueue<T, I, S> {}
-unsafe impl<T: Send + Sync, I: IsolatedSlotable, const S: bool> Sync for BoundedQueue<T, I, S> {}
-
-pub type AllocBoundedQueue<T> = BoundedQueue<T, Box<[UnsafeCell<Option<T>>]>, false>;
-
+unsafe impl<T: Send + Sync, I: private::Sealed, R, const SEAL: usize> Send for BoundedQueue<T, I, R, SEAL> {}
+unsafe impl<T: Send + Sync, I: private::Sealed, R, const SEAL: usize> Sync for BoundedQueue<T, I, R, SEAL> {}
 
 /// A constant generic constant bounded queue, this implements the SCQ from the ACM paper,
 /// "A Scalable, Portable, and Memory-Efficient Lock-Free FIFO Queue" by Ruslan Nikolaev.
+///
+/// Generally, if you want to work with these what you really want is the [const_queue!](crate::const_queue) macro
+/// which will configure the size for you properly. Due to the inner workings of the data structure, it needs 2 * N slots
+/// to operate properly. Thus, to make a constant queue of size 2, the constant parameter should be set to `4`. To ease
+/// the burden of this, the [const_queue!](crate::const_queue) macro exists.
+///
+/// # Preferred Initialization
+/// ```
 /// 
-/// The generic parameter must be chosen intelligently, you must choose N = 2 * n where
-/// n is the amount of elements you wish to store. For instance, for a buffer of capacity 2 you would
-/// use N = 2 * 2 = 4.
+/// ```
 /// 
-/// # Example
+/// # Manual Example
 /// ```
 /// use lfqueue::{ConstBoundedQueue, ScqError};
-/// 
-/// let queue = ConstBoundedQueue::<usize, 4>::new_const_queue();
-/// 
+///
+/// // Make a queue of size 4.
+/// let queue = ConstBoundedQueue::<usize, 4>::new_const();
+///
 /// assert_eq!(queue.capacity(), 2);
 /// assert!(queue.enqueue(2).is_ok());
 /// assert!(queue.enqueue(3).is_ok());
 /// assert_eq!(queue.enqueue(4), Err(ScqError::QueueFull));
 /// ```
-pub type ConstBoundedQueue<T, const N: usize> = BoundedQueue<T, [Option<T>; N], false>;
+pub type ConstBoundedQueue<T, const N: usize> =
+    BoundedQueue<T, [UnsafeCell<Option<T>>; N], [CachePadded<AtomicUsize>; N], 0>;
+
+
+/// Creates a [ConstBoundedQueue]. This function exists mostly to creates
+/// queues of the correct size easily. For instance, to create a queue that can
+/// hold 2 values, the bound needs to be four. This macro assists with that by generating
+/// an initialization that takes this into account.
+/// 
+/// # Compile Error
+/// Constant queues have a few limitations due to the inner workings of the ring:
+/// 1. They must not be empty. You cannot create an `empty` ring.
+/// 2. They must be powers of two. Thus only 1, 2, 4, etc. are valid.
+/// 
+/// # Example
+/// ```
+/// use lfqueue::{const_queue, ConstBoundedQueue, ScqError};
+/// 
+/// // Let us create a constant queue of size 1.
+/// let queue = const_queue!(usize; 1);
+/// assert!(queue.enqueue(1).is_ok());
+/// assert_eq!(queue.enqueue(2), Err(ScqError::QueueFull));
+/// 
+/// // Let us create a constant queue of size 8;
+/// let queue = const_queue!(usize; 8);
+/// for i in 0..8 {
+///     assert!(queue.enqueue(i).is_ok());
+/// }
+/// assert!(queue.enqueue(0).is_err()); // queue full
+/// 
+/// ```
+#[macro_export]
+macro_rules! const_queue {
+    ($ttype:ty; $size:expr) => {
+        ConstBoundedQueue::<$ttype, {
+            const _ASSERT: () = {
+                assert!($size != 0, "Size cannot be empty for constant queues.");
+                assert!($size % 2 == 0 || $size == 1, "Size is not valid for a constant queue. Must be even or one.");
+                ()
+            };
+            $size * 2
+
+        }>::new_const()
+    };
+}
 
 
 
 impl<T, const N: usize> ConstBoundedQueue<T, N> {
-
     /// A helper function for creating constant bounded queues, will automatically
     /// try to calculate the correct order.
-    /// 
+    ///
     /// # Panics
     /// This function will panic if the value is not a power of two and also if the
     /// value is zero as we cannot initialize zero sized constant bounded queues.
-    /// 
+    ///
     /// # Example
     /// ```
     /// use lfqueue::{ConstBoundedQueue, ScqError};
-    /// 
-    /// let queue = ConstBoundedQueue::<usize, 4>::new_const_queue();
+    ///
+    /// let queue = ConstBoundedQueue::<usize, 4>::new_const();
     /// assert!(queue.enqueue(2).is_ok());
     /// assert!(queue.enqueue(3).is_ok());
     /// assert_eq!(queue.enqueue(4), Err(ScqError::QueueFull));
     /// ```
-    pub fn new_const_queue() -> Self {
+    pub fn new_const() -> Self {
         if const { N } % 2 != 0 {
             panic!("Value must be a power of two.");
         }
         if const { N } == 0 {
             panic!("Constant arrays cannot be initialized to be empty.");
         }
-        let order = (const { N } >> 1) - 1;
-        Self::new(order)
-
-    }
-}
-
-
-/// A bounded queue as described in the ACM paper.
-/// 
-/// Internally, this just manages two independent SCQ rings  & a backing buffer that store
-/// indexes. There are two rings,
-/// - `free ring`: stores all the free indices.
-/// - `alloc ring`: stores all the currently allocated indices.
-/// 
-/// The SCQ rings themselves can *only* store indices, and each queue stores an index uniquely. That is,
-/// an index only ever belongs to the free ring or the alloc ring, but never both.
-/// 
-impl<T, I> BoundedQueue<T, I, false>
-where 
-    I: IsolatedSlotable<Type = T>
-{
-    pub fn new(order: usize) -> Self {
-        Self::hidden_new(order)
-    }
-}
-
-impl<T, const N: usize> private::Sealed for [Option<T>; N] {}
-
-unsafe impl<T, const N: usize> IsolatedSlotable for [Option<T>; N] {
-
-    type Type = T;
-
-    /// Creates a new array and checks that N == 1 << (order + 1)
-    fn new(order: usize) -> Self {
-        assert_eq!(1 << (order + 1), const { N }, "N must be equal to 2 ^ (order + 1)");
-        core::array::from_fn(|_| None)
-    }
-
-    unsafe fn unique_index(&self, index: usize) -> *mut Option<Self::Type> {
-        &self[index] as *const Option<T> as *mut Option<T>
-    }
-}
-
-
-impl<T> private::Sealed for Box<[UnsafeCell<Option<T>>]> {}
-
-unsafe impl<T> IsolatedSlotable for Box<[UnsafeCell<Option<T>>]> {
-    type Type = T;
-    fn new(order: usize) -> Self {
-        let size = 1 << (order + 1);
-        (0..size).map(|_| UnsafeCell::new(None)).collect::<Vec<_>>().into_boxed_slice()
-    }
-    unsafe fn unique_index(&self, index: usize) -> *mut Option<Self::Type> {
-        self[index].get()
-    }
-}
-
-//(0..size)
-                // .map(|_| UnsafeCell::new(None))
-                // .collect::<Vec<_>>()
-                // .into_boxed_slice()
-                
-impl<T, I, const S: bool> BoundedQueue<T, I, S>
-where 
-    I: IsolatedSlotable<Type = T>
-{
-
-    pub const MAX_ORDER: usize = 63;
-    pub const MIN_ORDER: usize = 0;
-
-    fn hidden_new(order: usize) -> Self {
-        // let size = 1 << (order + 1);
+        
         Self {
-            backing: I::new(order),
-            free_queue: ScqRing::new_full(order),
-            alloc_queue: ScqRing::new(order),
+            alloc_queue: ScqRing::new_const_ring_empty(),
+            free_queue: ScqRing::new_const_ring_full(),
+            backing: core::array::from_fn(|_| UnsafeCell::new(None)),
             used: CachePadded::new(AtomicUsize::new(0)),
             _type: PhantomData,
         }
     }
+}
+
+impl<T, I, P, const S: usize> BoundedQueue<T, I, P, S>
+where
+    I: AsRef<[UnsafeCell<Option<T>>]> + private::Sealed,
+    P: AsRef<PaddedAtomics> + private::Sealed,
+{
+    pub const MAX_ORDER: usize = 63;
+    pub const MIN_ORDER: usize = 0;
+
+    /// Returns the capacity of the bounded ring. This is 2 ^ order.
+    /// 
+    /// # Example
+    /// ```
+    /// use lfqueue::ConstBoundedQueue;
+    /// 
+    /// let value = ConstBoundedQueue::<usize, 4>::new_const();
+    /// assert_eq!(value.capacity(), 2);
+    /// ```
     pub fn capacity(&self) -> usize {
         self.free_queue.capacity()
     }
 
     /// Enqueues an element to the bounded queue.
-    /// 
+    ///
     /// # Example
     /// ```
     /// use lfqueue::AllocBoundedQueue;
-    /// 
+    ///
     /// let queue = AllocBoundedQueue::<usize>::new(2);
     /// assert_eq!(queue.enqueue(4), Ok(()));
     /// assert_eq!(queue.dequeue(), Some(4));
@@ -553,116 +619,99 @@ where
     pub fn enqueue(&self, item: T) -> Result<(), ScqError> {
         // We want to make a call to the internal method here
         // without finalizing. If someone is calling the method
-        // with [ScqQueue::enqueue] then it is not part of an unbounded
+        // with [BounedQueue::enqueue] then it is not part of an unbounded
         // queue.
+        //
+        // The idea is to make this into the public method, as a developer
+        // using the crate should never have to make the decision whether
+        // to enqueue with finalization or not.
         self.enqueue_cycle::<false>(item).map_err(|(_, b)| b)
     }
 
-    /// The internal enqueue function. This prevents cloning by returning the original
+    /// Indexes a raw pointer to an index.
     /// 
+    /// # Safety
+    /// The index must be within bounds always. This will skip
+    /// the bounds check in release mode.
     #[inline(always)]
-    fn enqueue_cycle<const FINALIZE: bool>(&self, item: T) -> Result<(), (T, ScqError)> {
-        // let current = self.used.fetch_add(1, Acquire);
+    unsafe fn index_ptr(&self, index: usize) -> *mut Option<T> {
+        let bref = self.backing.as_ref();
+        debug_assert!((0..bref.len()).contains(&index), "Index is out of bounds.");
+        // SAFETY: The caller safety contract requires the index to be valid.
+        unsafe { bref.get_unchecked(index) }.get()
+    }
 
-        // Check if we
+    /// The internal enqueue function. This prevents cloning by returning the original
+    ///
+    #[inline(always)]
+    pub(crate) fn enqueue_cycle<const FINALIZE: bool>(&self, item: T) -> Result<(), (T, ScqError)> {
+        // Check if we may add an item to the queue.
         let size = self.used.fetch_add(1, AcqRel);
         if size >= self.free_queue.capacity() {
-            // if self.free_queue.capacity() <= self.used.fetch_add(1, AcqRel) {
             self.used.fetch_sub(1, AcqRel);
             return Err((item, ScqError::QueueFull));
         }
 
-        // self.used.fetch_add(1, Acquire);
-
+        // Check if we may dequeue an item.
         let Some(pos) = self.free_queue.dequeue() else {
             self.used.fetch_sub(1, AcqRel);
             return Err((item, ScqError::QueueFull));
         };
 
-        // println!("Enqueing @ {pos}");
-        // println!("Accessing {pos}...");
-
-        // println!("[ {pos} ]");
-        // let pos = self.free_queue.dequeue().expect("Queue should be able to store 2^(order + 1) items but errored while dequeing a free slot that should have been present.");
-
-        // SAF
-        unsafe { *self.backing.unique_index(pos) = Some(item) };
-        
-        // unsafe { (*self.backing[pos].get()) = Some(item) };
-        // std::sync::atomic::fence(std::sync::atomic::Ordering::Release); // prevent reordering
-        // unsafe { (&mut *self.backing.get())[pos] = Some(item) };
-        // let slot = unsafe { &mut (&mut *self.backing.get())[pos] };
-
-        // SAFETY: No one else has access to this slot.
-        // *slot = Some(item);
-        // unsafe { *slot.get() = Some(item) };
+        // SAFETY: the ring only contains valid indices.
+        unsafe { *self.index_ptr(pos) = Some(item) };
 
         if let Err(error) = self.alloc_queue.enqueue(pos) {
-            // println!("error: {:?}", error);
-            debug_assert_eq!(error, ScqError::QueueFinalized, "Received a queue full notification.");
-           
+            debug_assert_eq!(
+                error,
+                ScqError::QueueFinalized,
+                "Received a queue full notification."
+            );
+
             self.used.fetch_sub(1, AcqRel);
-            let item = unsafe { (*self.backing.unique_index(pos)).take() };
+            let item = unsafe { (*self.index_ptr(pos)).take() };
             self.free_queue.enqueue(pos).unwrap();
             return Err((item.unwrap(), error));
         }
 
-        // println!("Scheduled @ {pos}");
-        if const { FINALIZE } {
+
+        if const { FINALIZE } && size + 1 >= self.free_queue.capacity() {
             // As described in the paper we must finalize this queue
             // so that nothing more will be added to it.
-            if size + 1 >= self.free_queue.capacity() {
-                // println!("Hello...");
-                self.alloc_queue.finalize();
-            }
+            self.alloc_queue.finalize();
         }
 
-        // self.alloc_queue.enqueue(pos)?;
 
         Ok(())
     }
     /// Dequeues an element from the bounded queue.
-    /// 
+    ///
     /// # Example
     /// ```
     /// use lfqueue::AllocBoundedQueue;
-    /// 
+    ///
     /// let queue = AllocBoundedQueue::<usize>::new(2);
     /// assert_eq!(queue.enqueue(4), Ok(()));
     /// assert_eq!(queue.dequeue(), Some(4));
     /// ```
-    pub fn dequeue(&self) -> Option<T>
-    {
-        // println!("Starting dequeue../. (A)");
+    pub fn dequeue(&self) -> Option<T> {
+        // Dequeue an allocated position, if this returns
+        // some it will become a unique index.
         let pos = self.alloc_queue.dequeue()?;
-        // println!("Position: {pos}");
-        // println!("Finishing dequeue... (A)");
 
-        // println!("Pos: {:?}", pos);
 
+        // Decrease the length of the queue.
         self.used.fetch_sub(1, AcqRel);
 
-        // std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire); // prevent reordering
-        let value = unsafe { (*self.backing.unique_index(pos)).take() };
-        // std::sync::atomic::fence(std::sync::atomic::Ordering::Release); // prevent reordering
-
-        let Some(value) = value else {
-            panic!("Failed to fetch, the position was: {pos}");
+        // Take the value out of the option
+        let Some(value) = (unsafe { (*self.index_ptr(pos)).take() }) else {
+            panic!("Failed to remove a value from the slot.");
         };
 
-        // let value = unsafe { &mut *self.holder[pos].get() }.take().unwrap();
-
-        // println!("{{ {pos} }}");
-
-        // This slot is now freed again!
-
+        // Enqueue error, this should never happen.
         if let Err(e) = self.free_queue.enqueue(pos) {
-            // println!("{self:?}");
-
             panic!("ScqError: {e:?}");
         }
-        // self.free_queue.enqueue(pos).unwrap();
-
         Some(value)
     }
 }
@@ -674,471 +723,15 @@ fn lfring_map(idx: usize, n: usize) -> usize {
 }
 
 
-/// The internals of the LCSQ queue, holds the atomic pointers. These are from the `haphazard` crate by
-/// John Gjengset, which is a great way of implementing hazard pointers to address the ABA problem.
-/// 
-/// The structure contains a head and tail and is a basic queue of [BoundedQueue]. Although this queue is
-/// slightly less efficient than the highly efficient [BoundedQueue] implementation, the asymptotic complexity
-/// is largely dominated by the bounded queue.
-/// 
-/// # References
-/// Hazard Pointers & ABA problem, https://karevongeijer.com/blog/lock-free-queue-in-rust/
-#[derive(Debug)]
-pub struct UnboundedQueueInternal<T> {
-    head: CachePadded<HazardAtomicPtr<LscqNode<T>>>,
-    tail: CachePadded<HazardAtomicPtr<LscqNode<T>>>,
-    internal_order: usize,
-}
-
-/// Stores the actual [BoundedQueue] along with a pointer
-/// to the next node within the queue. This gives us an
-/// unbounded amount of storage.
-#[derive(Debug)]
-struct LscqNode<T> {
-    value: BoundedQueue<T, Box<[UnsafeCell<Option<T>>]>, true>,
-    next: haphazard::AtomicPtr<LscqNode<T>>,
-}
-
-impl<T> LscqNode<T> {
-    /// Allocates a new [LscqNode] object with an order. This
-    /// will create a queue with a size of 2 ^ (order + 1).
-    pub fn allocate(order: usize) -> NonNull<Self> {
-        NonNull::from(Box::leak(Box::new(Self::new(order))))
-    }
-    fn new(order: usize) -> Self {
-        Self {
-            next: unsafe { haphazard::AtomicPtr::new(std::ptr::null_mut()) },
-            value: BoundedQueue::hidden_new(order),
-        }
-    }
-}
-
-#[inline(always)]
-fn yield_marker() {
-    // std::thread::yield_now();
-    #[cfg(loom)]
-    loom::thread::yield_now();
-}
 
 
-type HazardAtomicPtr<T> = haphazard::AtomicPtr<T>;
 
-// TODO: Implement finalization properly.
-
-/// Checks the null alignment.
-/// https://gitlab.com/bzim/lockfree/-/blob/master/src/ptr.rs?ref_type=heads
-#[inline(always)]
-pub fn check_null_align<T>() {
-    debug_assert!(null_mut::<T>() as usize % align_of::<T>() == 0);
-}
-
-impl<T: Send + Sync> UnboundedQueueInternal<T> {
-    /// Creates a new [LcsqQueue] with a single internal ring.
-    pub fn new(segment_order: usize) -> Self {
-        let queue = LscqNode::allocate(segment_order);
-
-        let queue_ptr = queue.as_ptr();
-        // println!("initial {:?}", queue_ptr);
-
-        // Check the null alignment of the `LscqNode`.
-        check_null_align::<LscqNode<T>>();
-        Self {
-            head: unsafe { HazardAtomicPtr::new(queue_ptr) }.into(),
-            tail: unsafe { HazardAtomicPtr::new(queue_ptr) }.into(),
-            internal_order: segment_order
-        }
-    }
-    /// Enqueues an element of type `T` into the queue.
-    pub fn enqueue(&self, hp: &mut HazardPointer<'_>, mut element: T)
-    {
-        loop {
-            let cq_ptr = self.tail.safe_load(hp).unwrap();
-            // let cq_ptr = self.tail.load(Acquire);
-            // SAFETY: The tail can never be a null pointer so we can
-            // safely dereference. Additionally, there are never any mutabkle
-            // pointers to this memory address.
-            // println!("Accessing {cq_ptr:?} (D)");
-            // let cq = unsafe { &*cq_ptr };
-
-            // If the next pointer is not null then we want to keep
-            // going next until we have found the end.
-            let next_ptr = cq_ptr.next.load_ptr();
-            if !next_ptr.is_null() {
-                unsafe {
-                    let _ = self
-                    .tail
-                    .compare_exchange_ptr(cq_ptr as *const LscqNode<T> as *mut LscqNode<T>, next_ptr);
-                }
-                
-                yield_marker();
-                continue;
-            }
-
-            // Attempts to enqueue the item, we should finalize the
-            // queue if we can.
-            match cq_ptr.value.enqueue_cycle::<true>(element) {
-                Ok(_) => {
-                    // We are done and have succesfully enqueued the item.
-                    return;
-                }
-                Err((elem, _)) => {
-                    // We do not care that we failed here, we just want to
-                    // return the value to the element flow so that the borrow checker will be happy.
-                    element = elem;
-                }
-            }
-
-            // Allocate a new queue.
-            // std::sync::atomic::fence(Acquire);
-
-            let ncq = LscqNode::new(self.internal_order);
-            ncq.value
-                .enqueue(element)
-                .expect("Freshly allocated queue could not accept one value.");
-            // The forget_inner prevents miri from detecting data race?
-            let ncq = NonNull::from(Box::leak(Box::new(ncq)));
-            // println!("Allocated: {:?}", ncq);
-            // std::sync::atomic::compiler_fence(SeqCst);
-            // std::sync::atomic::fence(SeqCst);
-
-            // Try to insert a new tail into the queue.
-            if unsafe { cq_ptr
-                .next
-                .compare_exchange_ptr(null_mut(), ncq.as_ptr())
-                .is_ok() }
-            {
-                // Correct the list ordering.
-                let _ = unsafe { self
-                    .tail
-                    .compare_exchange_ptr(cq_ptr as *const LscqNode<T> as *mut LscqNode<T>, ncq.as_ptr()) };
-                // NOTE: We do not have to free the allocation here
-                // because we haave succesfully put it into the list.
-                return;
-            }
-
-            // Extract the first element so the borrow checker is happy and we
-            // can avoid clones.
-            // SAFETY: This is the only instance of this pointer
-            // and it is non-null because we allocated it with `OwnedAlloc`.
-            // println!("Accessing {ncq:?} (E)");
-            let Some(value) = (unsafe { ncq.as_ref().value.dequeue() }) else {
-                panic!("Failed to access previously enqueued value.")
-            };
-            element = value;
-            // element = unsafe { ncq.as_ref().value.dequeue().unwrap() };
-
-            // SAFETY: The allocation was created with `OwnedAlloc` and we
-            // have unique access to it.
-            unsafe {
-                free_owned_alloc(ncq.as_ptr());
-            }
-
-            yield_marker();
-        }
-    }
-    /// Removes an element from the queue returning an [Option]. If the queue
-    /// is empty then the returned value will be [Option::None].
-    pub fn dequeue(&self, hp:&mut HazardPointer<'_>, next: &mut HazardPointer  ) -> Option<T>
-    {
-        loop {
-            // SAFETY: The head node will always be a non-null node.
-            // let head_ptr = self.head;
-            let cq_ptr = self.head.safe_load(hp).unwrap();
-            // SAFETY: The pointer is non-null and there are only immutable
-            // references to it. Additionlly, since it is the head, there are
-            // no mutable references to this memory location.
-            // println!("Accessing {cq_ptr:?} (A)");
-            // let cq = unsafe { &*cq_ptr.as_ptr() };
-
-            // Dequeue an entry.
-            // println!("Enteirng...");
-            let mut p = cq_ptr.value.dequeue();
-            // println!("Existing...");
-            if p.is_some() {
-                // The entry actually holds a value, in this case,
-                // we can just return the value.
-                return p;
-            }
-
-            // If the next pointer is null then we have nothing
-            // to dequeue and thus we can just return [Option::None].
-            if cq_ptr.next.safe_load(next).is_none() {
-                return None;
-            }
-            // Update the threshold.
-            cq_ptr.value
-                .alloc_queue
-                .threshold
-                .store(3 * (1 << (cq_ptr.value.free_queue.order + 1)) - 1, SeqCst);
-
-            // Try dequeing again.
-            p = cq_ptr.value.dequeue();
-            if p.is_some() {
-                return p;
-            }
-
-            
-            if let Ok(mut ok) = unsafe { self.head.compare_exchange_ptr(cq_ptr as *const LscqNode<T> as *mut LscqNode<T>, cq_ptr.next.load_ptr()) } {
-                unsafe { ok.take().unwrap().retire() };
-            }
-
-            // Here we remove the SCQ.
-            // let cq_ptr = unsafe { NonNull::new_unchecked(self.head.load(Acquire)) };
-            // unsafe { self.free_front(cq_ptr, &pause) }?;
-            // unsafe { self.head.retire() };
-
-            yield_marker();
-            // println!("injunctive");
-        }
-    }
-}
-
-impl<T> Drop for UnboundedQueueInternal<T> {
-    /// Drops the queue, deallocating all the nodes. Requires
-    /// exclusive access to the queue.
-    fn drop(&mut self) {
-        let mut next = self.head.load_ptr();
-        while !next.is_null() {
-            // SAFETY: If drop is called then we have exclusive access
-            // to this strucutture. TODO: Improve docs with inspiration from lockfree crate.
-            unsafe {
-                let temp = next;
-                next = (*next).next.load_ptr();
-                free_owned_alloc(temp);
-            }
-        }
-    }
-}
-
-/// A enqueue handle to an [UnboundedQueue], allowing for
-/// bulk enqueues efficiently. Internally, the unbounded queue manages
-/// the queue of bounded queues with hazard pointers to avoid the ABA problem, this
-/// allows minimizing the creation of these hazard pointers.
-/// 
-/// # Example
-/// ```
-/// use lfqueue::UnboundedQueue;
-/// 
-/// let queue = UnboundedQueue::<usize>::new(2);
-/// let mut handle = queue.enqueue_handle();
-/// handle.enqueue(3);
-/// ```
-pub struct UnboundedEnqueueHandle<'a, T> {
-    internal: &'a UnboundedQueueInternal<T>,
-    primary: HazardPointer<'static>
-}
-
-impl<'a, T> UnboundedEnqueueHandle<'a, T>
-where 
-    T: Send + Sync
-{
-    /// Enqueues an item on the underlying queue.
-    /// 
-    /// # Example
-    /// ```
-    /// use lfqueue::{UnboundedEnqueueHandle, UnboundedQueue};
-    /// 
-    /// let queue = UnboundedQueue::<usize>::new(2);
-    /// let mut handle = queue.enqueue_handle();
-    /// handle.enqueue(3);
-    /// ```
-    pub fn enqueue(&mut self, item: T) {
-        self.internal.enqueue(&mut self.primary, item);
-    }
-}
-
-/// A full handle to an [UnboundedQueue], allowing for
-/// bulk enqueues efficiently. Internally, the unbounded queue manages
-/// the queue of bounded queues with hazard pointers to avoid the ABA problem, this
-/// allows minimizing the creation of these hazard pointers.
-/// 
-/// # Example
-/// ```
-/// use lfqueue::UnboundedQueue;
-/// 
-/// let queue = UnboundedQueue::<usize>::new(2);
-/// let mut handle = queue.full_handle();
-/// handle.enqueue(3);
-/// 
-/// assert_eq!(handle.dequeue(), Some(3));
-/// assert!(handle.dequeue().is_none());
-/// ```
-pub struct UnboundedFullHandle<'a, T> {
-    enqueue: UnboundedEnqueueHandle<'a, T>,
-    secondary: HazardPointer<'static>
-}
-
-impl<'a, T> UnboundedFullHandle<'a, T>
-where 
-    T: Send + Sync
-{
-    /// Enqueues an item on the underlying queue.
-    /// 
-    /// # Example
-    /// ```
-    /// use lfqueue::{UnboundedFullHandle, UnboundedQueue};
-    /// 
-    /// let queue = UnboundedQueue::<usize>::new(2);
-    /// let mut handle = queue.full_handle();
-    /// handle.enqueue(3);
-    /// ```
-    pub fn enqueue(&mut self, item: T) {
-        self.enqueue.internal.enqueue(&mut self.enqueue.primary, item);
-    }
-    /// Enqueues an item on the underlying queue.
-    /// 
-    /// # Example
-    /// ```
-    /// use lfqueue::{UnboundedFullHandle, UnboundedQueue};
-    /// 
-    /// let queue = UnboundedQueue::<usize>::new(2);
-    /// let mut handle = queue.full_handle();
-    /// handle.enqueue(3);
-    /// 
-    /// assert_eq!(handle.dequeue(), Some(3));
-    /// ```
-    pub fn dequeue(&mut self) -> Option<T> {
-        self.enqueue.internal.dequeue(&mut self.enqueue.primary, &mut self.secondary)
-    }
-}
-
-
-/// An unbounded lock-free queue. This is the LCSQ from the ACM paper,
-/// "A Scalable, Portable, and Memory-Efficient Lock-Free FIFO Queue" by Ruslan Nikolaev.
-/// 
-/// Internally, it manages a linked list of bounded queue types and this allows it
-/// to grow in an unbounded manner. Since with a reasonable order new queue creation and deletion
-/// should be sparse, the operation cost is largely dominated by the internal queues and thus is still
-/// extremely fast.
-/// 
-/// # Example
-/// ```
-/// use lfqueue::UnboundedQueue;
-/// 
-/// let queue = UnboundedQueue::<usize>::new(2);
-/// queue.enqueue(4);
-/// queue.enqueue(5);
-/// 
-/// assert_eq!(queue.dequeue(), Some(4));
-/// assert_eq!(queue.dequeue(), Some(5));
-/// ```
-pub struct UnboundedQueue<T> {
-    internal: UnboundedQueueInternal<T>,
-    order: usize
-}
-
-unsafe impl<T: Send + Sync> Send for UnboundedQueue<T> {}
-unsafe impl<T: Send + Sync> Sync for UnboundedQueue<T> {}
-
-impl<T> UnboundedQueue<T>
-where 
-    T: Send + Sync
-{
-    /// Creates a new [UnboundedQueue] with an initial ring order of `order`. This means
-    /// each queue segment has a size of 2 ^ order.
-    /// 
-    /// # Examples
-    /// ```
-    /// use lfqueue::UnboundedQueue;
-    /// 
-    /// let queue = UnboundedQueue::<()>::new(2);
-    /// assert_eq!(queue.base_segment_capacity(), 4);
-    /// ```
-    pub fn new(order: usize) -> Self {
-        Self {
-            internal: UnboundedQueueInternal::new(order),
-            order
-        }
-    }
-    /// Returns the base segment capacity of the [UnboundedQueue], this is the
-    /// capacity of the base ring. Or in other words, 2 ^ order.
-    /// 
-    /// # Examples 
-    /// ```
-    /// use lfqueue::UnboundedQueue;
-    /// 
-    /// let queue = UnboundedQueue::<()>::new(2);
-    /// assert_eq!(queue.base_segment_capacity(), 4);
-    /// ```
-    pub fn base_segment_capacity(&self) -> usize {
-        1 << self.order
-    }
-    /// Creates an [UnboundedEnqueueHandle] that allows for the execution of
-    /// many 
-    /// 
-    /// # Example
-    /// ```
-    /// use lfqueue::{UnboundedEnqueueHandle, UnboundedQueue};
-    /// 
-    /// let queue = UnboundedQueue::<usize>::new(2);
-    /// let mut handle = queue.enqueue_handle();
-    /// handle.enqueue(3);
-    /// handle.enqueue(4);
-    /// ```
-    pub fn enqueue_handle(&self) -> UnboundedEnqueueHandle<'_, T> {
-        UnboundedEnqueueHandle {
-            internal: &self.internal,
-            primary: HazardPointer::new()
-        }
-    }
-    pub fn full_handle(&self) -> UnboundedFullHandle<'_, T> {
-        UnboundedFullHandle { enqueue: self.enqueue_handle(), secondary: HazardPointer::new() }
-    }
-    /// Enqueues a single entry. Internally, this just creates an [UnboundedEnqueueHandle] and
-    /// performs a single enqueue operation. If you intend to do several enqueues in a row, please
-    /// see [UnboundedQueue::enqueue_handle].
-    /// 
-    /// # Example
-    /// ```
-    /// use lfqueue::UnboundedQueue;
-    /// 
-    /// let queue = UnboundedQueue::<usize>::new(2);
-    /// queue.enqueue(4);
-    /// ```
-    pub fn enqueue(&self, item: T)
-    {
-        self.enqueue_handle().enqueue(item);
-    }
-
-    /// Dequeues a single entry. Internally, this just creates an [UnboundedFullHandle] and performs
-    /// a single dequeue operation. If you intend to do several dequeues in a row, please see
-    /// [UnboundedQueue::full_handle].
-    /// 
-    /// # Example
-    /// ```
-    /// use lfqueue::UnboundedQueue;
-    /// 
-    /// let queue = UnboundedQueue::<usize>::new(2);
-    /// queue.enqueue(2);
-    /// 
-    /// assert_eq!(queue.dequeue(), Some(2));
-    /// ```
-    pub fn dequeue(&self) -> Option<T>
-    {
-       self.full_handle().dequeue()
-    }
-}
-
-/// Frees memory allocated by an [Box]. This uses manual ma
-///
-/// # Safety
-/// This ptr must have been produced with [Box::leak] and represent
-/// a valid pointer to initialized memory.
-unsafe fn free_owned_alloc<T>(ptr: *mut T) {
-    // SAFETY: The pointer is non-null and represents a valid
-    // pointer to initialized memory and was constructed via a box allocation.
-    drop(unsafe { Box::from_raw(ptr)  });
-}
 
 #[cfg(test)]
 mod tests {
-    use std::marker::PhantomData;
+    // use std::marker::PhantomData;
 
-    use lockfree::queue;
-
-    use crate::scq::{
-        lfring_signed_cmp, AllocBoundedQueue, BoundedQueue, ScqError, ScqRing, UnboundedQueue
-    };
+    use crate::scq::{ScqError, lfring_signed_cmp};
 
     #[cfg(loom)]
     #[test]
@@ -1157,7 +750,6 @@ mod tests {
                 // Anything after this should be an error.
                 assert!(v1.enqueue(0).is_err());
             });
-        
         });
     }
 
@@ -1272,86 +864,12 @@ mod tests {
     //     });
     // }
 
-    
-
+    #[test]
     #[cfg(not(loom))]
-    #[test]
-    pub fn lcsq_circus() {
-        use std::sync::{Arc, Barrier};
-
-        use crate::scq::AllocBoundedQueue;
-
-        let context = Arc::new(AllocBoundedQueue::new(3));
-        loop {
-            
-        let threads = 50;
-        let thread_runs = 100;
-
-        // let barrier = Arc::new(Barrier::new(threads));
-
-        // let barrier_finalized = Arc::new(Barrier::new(threads + 1));
-        let mut handles = vec![];
-        for _ in 0..threads {
-            handles.push(std::thread::spawn({
-                // let barrier_finalized = barrier_finalized.clone();
-                let context = context.clone();
-                // let barrier = barrier.clone();
-                move || {
-                    // barrier.wait();
-                    // println!("hello");
-                    for i in 0..thread_runs {
-                        // println!("start queue...");
-                        let _ = context.enqueue(i);
-                        // println!("end queue...");
-                        // context.lock().unwrap().push_back(std::hint::black_box(i));
-                    }
-                    for _ in 0..thread_runs {
-                        // println!("Hello");
-                        context.dequeue();
-                        // println!("Bye...");
-                        // dequeue(&context);
-                        // context.lock().unwrap().pop_front();
-                    }
-                }
-            }));
-        }
-
-        for handle in handles {
-            handle.join().unwrap();
-        }
-        break;
-        }
-
-        // barrier_finalized.wait();
-        // println!("Done");
-    }
-
-
-    #[test]
-    pub fn verify_small_queue_correctness() {
-
-        fn queue_harness( order: usize) {
-            let queue = AllocBoundedQueue::new(order);
-            assert_eq!(queue.capacity(), 1 << order);
-            for i in 0..queue.capacity() {
-                queue.enqueue(i).unwrap();
-            }
-            for i in 0..queue.capacity() {
-                assert_eq!(queue.dequeue(), Some(i));
-            }
-            for i in 0..queue.capacity() {
-                assert_eq!(queue.dequeue(), None);
-            }
-        }
-
-        // Weird effects happen at small queue sized, this checks for that.
-        queue_harness(3);
-        queue_harness(2);
-        queue_harness(1);
-        queue_harness(0);
-
-
-
+    pub fn test_pow2() {
+        // this is just a sanity check for myself.
+        let half = 4;
+        assert_eq!(half * 2, half << 1);
     }
 
     #[test]
@@ -1359,75 +877,10 @@ mod tests {
     pub fn test_const_queue() {
         use crate::ConstBoundedQueue;
 
-        let queue = ConstBoundedQueue::<usize, 4>::new_const_queue();
+        let queue = ConstBoundedQueue::<usize, 4>::new_const();
         assert!(queue.enqueue(1).is_ok());
         assert!(queue.enqueue(2).is_ok());
         assert_eq!(queue.enqueue(3), Err(ScqError::QueueFull));
-
-    }
-
-    #[test]
-    #[cfg(not(loom))]
-    pub fn check_scq_fill() {
-        let mut fill = AllocBoundedQueue::new(3);
-        for i in 0..8 {
-            fill.enqueue(i).unwrap();
-        }
-        assert_eq!(fill.enqueue(0), Err(ScqError::QueueFull));
-    }
-
-
-
-
-
-    #[cfg(not(loom))]
-    #[test]
-    pub fn fullinit() {
-        let ring = ScqRing::<false>::new_full(3);
-
-        for i in 0..8 {
-            assert_eq!(ring.dequeue(), Some(i));
-        }
-    }
-
-    #[cfg(not(loom))]
-    #[test]
-    pub fn test_lcsq_ptr() {
-        let ring = UnboundedQueue::new(3);
-        for i in 0..16 {
-            ring.enqueue(i);
-        }
-
-        // println!("RING: {:?}", ring);
-
-        for i in 0..16 {
-            assert_eq!(ring.dequeue(), Some(i));
-            // println!("HELLO: {:?}", ring.dequeue());
-        }
-        // println!("HELLO: {:?}", ring.dequeue());
-    }
-
-    #[cfg(not(loom))]
-    #[test]
-    pub fn test_length_function() {
-        let ring = ScqRing::<false>::new(3);
-        assert_eq!(ring.capacity(), 8);
-
-        // println!(
-        //     "Threshold: {}",
-        //     ring.threshold.load(std::sync::atomic::Ordering::SeqCst)
-        // );
-
-        ring.enqueue(3).unwrap();
-        println!(
-            "Threshold: {}",
-            ring.threshold.load(std::sync::atomic::Ordering::SeqCst)
-        );
-        ring.enqueue(2).unwrap();
-        println!(
-            "Threshold: {}",
-            ring.threshold.load(std::sync::atomic::Ordering::SeqCst)
-        );
     }
 
     #[cfg(not(loom))]
@@ -1441,115 +894,75 @@ mod tests {
 
     #[cfg(not(loom))]
     #[test]
-    pub fn scqqueue_enq_deq() -> Result<(), ScqError> {
-        let holder = AllocBoundedQueue::new(3);
-        holder.enqueue("A")?;
-        holder.enqueue("B")?;
-        println!("Enqueued items.");
+    pub fn test_determine_order() {
+        use crate::scq::determine_order;
 
-        // println!("Holder: {:?}", holder);
-
-        assert_eq!(holder.dequeue(), Some("A"));
-        println!("pOpped");
-        assert_eq!(holder.dequeue(), Some("B"));
-
-        assert_eq!(holder.dequeue(), None);
-
-        Ok(())
+        assert_eq!(determine_order(1), 0);
+        assert_eq!(determine_order(2), 1);
+        assert_eq!(determine_order(4), 2);
+        assert_eq!(determine_order(512), 9);
     }
 
     #[cfg(not(loom))]
     #[test]
-    pub fn test_lfring_ptrs_full() {
-        // let ring = ScqRing::new(3);
-        // ring.enqueue(0x22cf301a020);
-        // println!("Value: {:?}", ring);
-        // assert_eq!(ring.dequeue(), Some(0x22cf301a020));
+    pub fn test_init_const_queue() {
+        // PURPOSE: the purpose of this test is to ensure
+        // the rings are getting initialized to the correct size.
+        use crate::{const_queue, ConstBoundedQueue};
 
-        let holder: AllocBoundedQueue<&str> = AllocBoundedQueue::new(3);
-        println!("Holder: {:?}", holder);
-        for _ in 0..holder.alloc_queue.capacity() {
-            holder.enqueue("A").unwrap();
+        // Check the queue for consistency.
+        fn check_queue<const N: usize>(queue: ConstBoundedQueue<usize, N>) {
+            assert_eq!(queue.capacity(), N >> 1);
+            for i in 0..(N >> 1) {
+                assert!(queue.enqueue(i).is_ok());
+            }
+            for i in 0..(N >> 1) {
+                assert_eq!(queue.enqueue(i), Err(ScqError::QueueFull));
+            }
+            for i in 0..(N >> 1) {
+                assert_eq!(queue.dequeue(), Some(i));
+            }
+            for _ in 0..(N >> 1) {
+                assert_eq!(queue.dequeue(), None);
+            }
         }
 
-        assert_eq!(holder.enqueue("I"), Err(ScqError::QueueFull));
-        // holder.enqueue("J").unwrap();
-        // holder.enqueue("K").unwrap();
-        // holder.enqueue("L").unwrap();
+        assert_eq!(const_queue!(usize; 1).capacity(), 1);
 
-        // holder.enqueue("hello").unwrap();
-        // println!("Holder: {:?}", holder);
-        // holder.enqueue("wow").unwrap();
+        // Check a few queues.
+        check_queue(const_queue!(usize; 1));
+        check_queue(const_queue!(usize; 2));
+        check_queue(const_queue!(usize; 4));
+        check_queue(const_queue!(usize; 8));
+        check_queue(const_queue!(usize; 16));
+        check_queue(const_queue!(usize; 32));
+        check_queue(const_queue!(usize; 64));
+        check_queue(const_queue!(usize; 128));
 
-        // assert_eq!(holder.dequeue(), Some("hello"));
-        // assert_eq!(holder.dequeue(), Some("wow"));
+
+  
     }
 
     #[cfg(not(loom))]
     #[test]
-    pub fn test_lfring_basic() {
-        let ring = ScqRing::<false>::new(3);
+    pub fn test_zst_const() {
+        use crate::ConstBoundedQueue;
 
-        // ring.enqueue(303030).unwrap();
 
-        for i in 0..ring.capacity() {
-            ring.enqueue(i).unwrap();
+        let queue = const_queue!((); 4);
+        assert_eq!(queue.capacity(), 4);
+        for _ in 0..queue.capacity() {
+            assert!(queue.enqueue(()).is_ok());
         }
+        assert_eq!(queue.enqueue(()), Err(ScqError::QueueFull));
 
-        for i in 0..ring.capacity() {
-            assert_eq!(ring.dequeue(), Some(i));
+        for _ in 0..queue.capacity() {
+            assert_eq!(queue.dequeue(), Some(()));
         }
-    }
+        assert!(queue.dequeue().is_none());
 
-    #[cfg(not(loom))]
-    #[test]
-    pub fn initialize_full_correctly() {
-        use std::sync::atomic::Ordering;
-
-        let mut ring = ScqRing::<false>::new(3);
-        for i in 0..ring.capacity() {
-            ring.enqueue(i).unwrap();
-        }
-
-        // println!("Capacity: {:?}", auto.capacity());
-
-        // auto.enqueue(1).unwrap();
-
+        assert!(queue.enqueue(()).is_ok());
         
-
-        // println!("Value: {:?}", auto.dequeue());
-
-        let mut auto = ScqRing::new_full(3);
-        
-        assert_eq!(ring, auto);
-
-        // for i in 0..16 {
-        //     println!("Value: {:?}", auto.dequeue());
-        // }
-
-        // auto = ring;
-
-        // println!("Manual: {:?}", ring);
-        // println!("Auto: {:?}", auto);
-
-        for i in 0..auto.capacity() {
-            // println!("I: {i}");
-            // let value = ring.enqueue(eidx)
-            let value = auto.dequeue();
-            assert_eq!(value, Some(i));
-            // println!("Enqueing {value:?}...");
-            auto.enqueue(value.unwrap()).unwrap();
-        }
-
-        // println!("Extra: {:?}", auto.dequeue());
-        // println!("Extra: {:?}", auto.dequeue());
-        // println!("Extra: {:?}", auto.dequeue());
-        for i in 0..auto.capacity() {
-            assert_eq!(auto.dequeue(),Some(i));
-            // println!("Dequeing... {:?}", auto.dequeue());
-            // assert_eq!(auto.dequeue(), Some((ring.capacity() - 1) - i));
-        }
-
 
     }
 }

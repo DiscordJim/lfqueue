@@ -1,9 +1,10 @@
 #![no_main]
 
 use arbitrary::*;
-use lfqueue::{GrindInstr, ScqQueue, configure_grind, MockQueue};
+use lfqueue::{GrindInstr, AllocBoundedQueue, configure_grind, MockQueue};
 use libfuzzer_sys::fuzz_target;
 use std::collections::VecDeque;
+
 
 fuzz_target!(|data: &[u8]| {
     let mut uns = Unstructured::new(data);
@@ -12,7 +13,7 @@ fuzz_target!(|data: &[u8]| {
 
     let mut mock = MockQueue::new(grind.order);
 
-    let mut queue = ScqQueue::<usize, false>::new(grind.order);
+    let mut queue = AllocBoundedQueue::new(grind.order);
 
     for operation in grind.instructions {
         match operation {

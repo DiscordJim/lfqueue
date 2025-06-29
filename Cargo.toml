@@ -43,3 +43,8 @@ required-features = ["std"]
 name = "syncqueue_many_cpus"
 harness = false
 required-features = ["std"]
+
+[[bench]]
+name = "singlesized"
+harness = false
+required-features = ["std"]

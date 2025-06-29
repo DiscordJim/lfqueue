@@ -52,6 +52,7 @@ assert_eq!(queue.dequeue(), Some(8));
 # Benchmarks
 The queues within the library were tested against several other queues. The benchmarking is not exhaustive, but the process can be seen in `benches/syncqueue.rs`.
 
+## Larger Queues
 
 | crate| structure | test | time (ms) |
 | ---- | ---- | ---- | ---- |
@@ -83,6 +84,29 @@ The queues within the library were tested against several other queues. The benc
 | std | `Mutex<VecDequeue>` | t=10,o=100 | 1.2141ms |
 | std | `Mutex<VecDequeue>` | t=100,o=100 | 13.509ms |
 | std | `Mutex<VecDequeue>` | t=100,o=10000 | 234.65ms |
+
+
+## Single shot
+Testing with a queue size of 1.
+
+| crate| structure | test | time (ms) |
+| ---- | ---- | ---- | ---- |
+| lfqueue | `ConstBoundedQueue` (1) | t=1,o=100 | 133.09µs |
+| lfqueue | `ConstBoundedQueue` (1) | t=10,o=100 | 980.12 µs |
+| lfqueue | `ConstBoundedQueue` (1) | t=100,o=100 | 12.108ms |
+| lfqueue | `ConstBoundedQueue` (1) | t=100,o=10000 | 34.351ms |
+| lfqueue | `AllocBoundedQueue` (1) | t=1,o=100 | 107.35µs |
+| lfqueue | `AllocBoundedQueue` (1) | t=10,o=100 | 1.0678ms |
+| lfqueue | `AllocBoundedQueue` (1) | t=100,o=100 | 11.853ms |
+| lfqueue | `AllocBoundedQueue` (1) | t=100,o=10000 | 165.84ms |
+| std | `Mutex<Option<T>>` (1) | t=1,o=100 | 98.686µs |
+| std | `Mutex<Option<T>>` (1) | t=10,o=100 | 879.31 µs |
+| std | `Mutex<Option<T>>` (1) | t=100,o=100 | 12.136ms |
+| std | `Mutex<Option<T>>` (1) | t=100,o=10000 | 165.66ms |
+| crossbeam | `ArrayQueue` (1) | t=1,o=100 | 124.43µs |
+| crossbeam | `ArrayQueue` (1) | t=10,o=100 | 1.1164ms |
+| crossbeam | `ArrayQueue` (1) | t=100,o=100 | 12.566ms |
+| crossbeam | `ArrayQueue` (1) | t=100,o=10000 | 97.277ms |
 
 
 

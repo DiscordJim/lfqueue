@@ -2,6 +2,9 @@
 name = "lfqueue"
 version = "0.1.0"
 edition = "2024"
+description = "Fast concurrent lock-free MPMC queues"
+license-file = "LICENSE"
+repository = "https://github.com/DiscordJim/lfqueue"
 
 
 [target.'cfg(loom)'.dependencies]

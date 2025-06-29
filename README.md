@@ -86,21 +86,6 @@ The queues within the library were tested against several other queues. The benc
 
 
 
-# Todo
-- finalization
-- send sync is proper
-- test on arm
-- document
-- main library doc
-- write better unit tests
-- add github workflow
-- writeup readme.md
-- full read of paper
-- verify paper is correct
-- add benchmarks to the readme
-- are orders actually handled properly?
-- relax bounds
-- verify that haphazard memory alloc is correct
 
 # Examples
 1. _Basic Trading Order Scheduler_: (`examples/trading.rs`) A very basic example showing a single loop publishing orders to a network, and another process that sends the orders out to the exchange.

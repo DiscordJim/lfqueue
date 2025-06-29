@@ -1,7 +1,5 @@
 use core::{
-    cell::UnsafeCell,
-    marker::PhantomData,
-    ptr::{NonNull, null_mut},
+    cell::UnsafeCell, fmt::Debug, marker::PhantomData, ptr::{null_mut, NonNull}
 };
 
 use crossbeam_utils::CachePadded;
@@ -446,6 +444,7 @@ where
     }
 }
 
+
 /// An unbounded lock-free queue. This is the LCSQ from the ACM paper,
 /// "A Scalable, Portable, and Memory-Efficient Lock-Free FIFO Queue" by Ruslan Nikolaev.
 ///
@@ -471,6 +470,16 @@ pub struct UnboundedQueue<T> {
     domain: Domain<QueueDomain>
 }
 
+
+impl<T: Debug> core::fmt::Debug for UnboundedQueue<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("UnboundedQueue")
+         .field("internal", &self.internal)
+         .field("size", &self.size)
+         .field("domain", &"Domain")
+         .finish()
+    }
+}
 
 /// The domain for queues.
 #[non_exhaustive]

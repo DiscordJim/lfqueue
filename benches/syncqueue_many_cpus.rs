@@ -18,11 +18,11 @@ impl Payload for AllocBoundedQueuePayload {
         (
             Self {
                 queue: shared_queue.clone(),
-                operations: 10, // Default small operations
+                operations: 100, // Match original syncqueue.rs scale
             },
             Self {
                 queue: shared_queue,
-                operations: 10,
+                operations: 100,
             },
         )
     }
@@ -30,27 +30,18 @@ impl Payload for AllocBoundedQueuePayload {
     fn prepare(&mut self) {
         // Queue is already created and shared between workers
     }
-
     fn process(&mut self) {
         let queue = &self.queue;
 
         // Pattern from original: enqueue all items, then dequeue all items
         // Enqueue phase
         for i in 0..self.operations {
-            let mut attempts = 0;
-            while queue.enqueue(i).is_err() && attempts < 50 {
-                std::thread::yield_now();
-                attempts += 1;
-            }
+            let _ = queue.enqueue(i);
         }
 
         // Dequeue phase
         for _ in 0..self.operations {
-            let mut attempts = 0;
-            while queue.dequeue().is_none() && attempts < 50 {
-                std::thread::yield_now();
-                attempts += 1;
-            }
+            black_box(queue.dequeue());
         }
     }
 }
@@ -67,11 +58,11 @@ impl Payload for UnboundedQueuePayload {
         (
             Self {
                 queue: shared_queue.clone(),
-                operations: 10,
+                operations: 100,
             },
             Self {
                 queue: shared_queue,
-                operations: 10,
+                operations: 100,
             },
         )
     }
@@ -109,11 +100,11 @@ impl Payload for ConstBoundedQueuePayload {
         (
             Self {
                 queue: shared_queue.clone(),
-                operations: 5, // Smaller for const queue
+                operations: 32, // Match array queue size for const queue
             },
             Self {
                 queue: shared_queue,
-                operations: 5,
+                operations: 32,
             },
         )
     }
@@ -121,26 +112,17 @@ impl Payload for ConstBoundedQueuePayload {
     fn prepare(&mut self) {
         // Queue is already created and shared between workers
     }
-
     fn process(&mut self) {
         let queue = &self.queue;
 
         // Enqueue phase
         for i in 0..self.operations {
-            let mut attempts = 0;
-            while queue.enqueue(i).is_err() && attempts < 20 {
-                std::thread::yield_now();
-                attempts += 1;
-            }
+            let _ = queue.enqueue(i);
         }
 
         // Dequeue phase
         for _ in 0..self.operations {
-            let mut attempts = 0;
-            while queue.dequeue().is_none() && attempts < 20 {
-                std::thread::yield_now();
-                attempts += 1;
-            }
+            black_box(queue.dequeue());
         }
     }
 }
@@ -157,11 +139,11 @@ impl Payload for MutexQueuePayload {
         (
             Self {
                 queue: shared_queue.clone(),
-                operations: 10,
+                operations: 100,
             },
             Self {
                 queue: shared_queue,
-                operations: 10,
+                operations: 100,
             },
         )
     }
@@ -197,11 +179,11 @@ impl Payload for LockfreeQueuePayload {
         (
             Self {
                 queue: shared_queue.clone(),
-                operations: 10,
+                operations: 100,
             },
             Self {
                 queue: shared_queue,
-                operations: 10,
+                operations: 100,
             },
         )
     }
@@ -237,11 +219,11 @@ impl Payload for CrossbeamSegQueuePayload {
         (
             Self {
                 queue: shared_queue.clone(),
-                operations: 10,
+                operations: 100,
             },
             Self {
                 queue: shared_queue,
-                operations: 10,
+                operations: 100,
             },
         )
     }
@@ -249,7 +231,6 @@ impl Payload for CrossbeamSegQueuePayload {
     fn prepare(&mut self) {
         // Queue is already created and shared between workers
     }
-
     fn process(&mut self) {
         let queue = &self.queue;
 
@@ -277,11 +258,11 @@ impl Payload for CrossbeamArrayQueuePayload {
         (
             Self {
                 queue: shared_queue.clone(),
-                operations: 5, // Smaller for bounded array queue
+                operations: 32, // Match array queue size
             },
             Self {
                 queue: shared_queue,
-                operations: 5,
+                operations: 32,
             },
         )
     }
@@ -295,20 +276,12 @@ impl Payload for CrossbeamArrayQueuePayload {
 
         // Enqueue phase
         for i in 0..self.operations {
-            let mut attempts = 0;
-            while queue.push(i).is_err() && attempts < 20 {
-                std::thread::yield_now();
-                attempts += 1;
-            }
+            let _ = queue.push(i);
         }
 
         // Dequeue phase
         for _ in 0..self.operations {
-            let mut attempts = 0;
-            while queue.pop().is_none() && attempts < 20 {
-                std::thread::yield_now();
-                attempts += 1;
-            }
+            black_box(queue.pop());
         }
     }
 }

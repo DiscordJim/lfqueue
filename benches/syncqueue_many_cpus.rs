@@ -6,71 +6,33 @@ use std::collections::VecDeque;
 use std::hint::black_box;
 use std::sync::{Arc, Mutex};
 
-// Configuration patterns matching the original PARAM_CONFIGS
-// We scale down the operations significantly for the many_cpus_benchmarking framework
-const SMALL_CONFIG: (usize, usize) = (1, 10);     // Original: (1, 100)
-const MEDIUM_CONFIG: (usize, usize) = (10, 10);   // Original: (10, 100)
-const LARGE_CONFIG: (usize, usize) = (100, 10);   // Original: (100, 100)
-const XLARGE_CONFIG: (usize, usize) = (100, 100); // Original: (100, 10000)
-
-/// Generic payload for benchmarking different queue types
-/// Each worker creates its own queue and performs enqueue-dequeue cycles
-/// This pattern matches the original syncqueue.rs behavior where each thread
-/// does enqueue operations followed by dequeue operations
-#[derive(Debug)]
-struct QueuePayload<Q> {
-    queue: Option<Arc<Q>>,
-    operations: usize,
-    queue_factory: fn() -> Q,
-}
-
-impl<Q> QueuePayload<Q> {
-    fn new_with_factory(operations: usize, factory: fn() -> Q) -> (Self, Self) {
-        (
-            Self {
-                queue: None,
-                operations,
-                queue_factory: factory,
-            },
-            Self {
-                queue: None,
-                operations,
-                queue_factory: factory,
-            },
-        )
-    }
-}
-
 /// Payload for AllocBoundedQueue benchmarking
 struct AllocBoundedQueuePayload {
-    queue: Option<Arc<AllocBoundedQueue<usize>>>,
+    queue: Arc<AllocBoundedQueue<usize>>,
     operations: usize,
-    queue_size: usize,
 }
 
 impl Payload for AllocBoundedQueuePayload {
     fn new_pair() -> (Self, Self) {
+        let shared_queue = Arc::new(AllocBoundedQueue::new(1024));
         (
             Self {
-                queue: None,
+                queue: shared_queue.clone(),
                 operations: 10, // Default small operations
-                queue_size: 1024,
             },
             Self {
-                queue: None,
+                queue: shared_queue,
                 operations: 10,
-                queue_size: 1024,
             },
         )
     }
 
     fn prepare(&mut self) {
-        // Each worker creates its own queue in its memory region
-        self.queue = Some(Arc::new(AllocBoundedQueue::new(self.queue_size)));
+        // Queue is already created and shared between workers
     }
 
     fn process(&mut self) {
-        let queue = self.queue.as_ref().expect("Queue should be initialized");
+        let queue = &self.queue;
         
         // Pattern from original: enqueue all items, then dequeue all items
         // Enqueue phase
@@ -95,33 +57,31 @@ impl Payload for AllocBoundedQueuePayload {
 
 /// Payload for UnboundedQueue benchmarking (matches bench_lscq_queue)
 struct UnboundedQueuePayload {
-    queue: Option<Arc<UnboundedQueue<usize>>>,
+    queue: Arc<UnboundedQueue<usize>>,
     operations: usize,
-    segment_size: usize,
 }
 
 impl Payload for UnboundedQueuePayload {
     fn new_pair() -> (Self, Self) {
+        let shared_queue = Arc::new(UnboundedQueue::with_segment_size(1024));
         (
             Self {
-                queue: None,
+                queue: shared_queue.clone(),
                 operations: 10,
-                segment_size: 1024,
             },
             Self {
-                queue: None,
+                queue: shared_queue,
                 operations: 10,
-                segment_size: 1024,
             },
         )
     }
 
     fn prepare(&mut self) {
-        self.queue = Some(Arc::new(UnboundedQueue::with_segment_size(self.segment_size)));
+        // Queue is already created and shared between workers
     }
 
     fn process(&mut self) {
-        let queue = self.queue.as_ref().expect("Queue should be initialized");
+        let queue = &self.queue;
         let mut full_handle = queue.full_handle();
         
         // Pattern from original run_benchmark_lscq: enqueue all, then dequeue all
@@ -137,30 +97,33 @@ impl Payload for UnboundedQueuePayload {
 
 /// Payload for ConstBoundedQueue benchmarking
 struct ConstBoundedQueuePayload {
-    queue: Option<Arc<ConstBoundedQueue<usize, 64>>>, // Using 64 to match const_queue!(usize; 32) -> 64 size
+    queue: Arc<ConstBoundedQueue<usize, 64>>, // Using 64 to match const_queue!(usize; 32) -> 64 size
     operations: usize,
 }
 
 impl Payload for ConstBoundedQueuePayload {
     fn new_pair() -> (Self, Self) {
+        #[allow(clippy::unused_unit)]
+        let shared_queue = Arc::new(const_queue!(usize; 32));
+        
         (
             Self {
-                queue: None,
+                queue: shared_queue.clone(),
                 operations: 5, // Smaller for const queue
             },
             Self {
-                queue: None,
+                queue: shared_queue,
                 operations: 5,
             },
         )
     }
 
     fn prepare(&mut self) {
-        self.queue = Some(Arc::new(const_queue!(usize; 32)));
+        // Queue is already created and shared between workers
     }
 
     fn process(&mut self) {
-        let queue = self.queue.as_ref().expect("Queue should be initialized");
+        let queue = &self.queue;
         
         // Enqueue phase
         for i in 0..self.operations {
@@ -184,30 +147,31 @@ impl Payload for ConstBoundedQueuePayload {
 
 /// Payload for Mutex<VecDeque> benchmarking
 struct MutexQueuePayload {
-    queue: Option<Arc<Mutex<VecDeque<usize>>>>,
+    queue: Arc<Mutex<VecDeque<usize>>>,
     operations: usize,
 }
 
 impl Payload for MutexQueuePayload {
     fn new_pair() -> (Self, Self) {
+        let shared_queue = Arc::new(Mutex::new(VecDeque::new()));
         (
             Self {
-                queue: None,
+                queue: shared_queue.clone(),
                 operations: 10,
             },
             Self {
-                queue: None,
+                queue: shared_queue,
                 operations: 10,
             },
         )
     }
 
     fn prepare(&mut self) {
-        self.queue = Some(Arc::new(Mutex::new(VecDeque::new())));
+        // Queue is already created and shared between workers
     }
 
     fn process(&mut self) {
-        let queue = self.queue.as_ref().expect("Queue should be initialized");
+        let queue = &self.queue;
         
         // Enqueue phase
         for i in 0..self.operations {
@@ -223,30 +187,31 @@ impl Payload for MutexQueuePayload {
 
 /// Payload for lockfree::queue::Queue benchmarking
 struct LockfreeQueuePayload {
-    queue: Option<Arc<lockfree::queue::Queue<usize>>>,
+    queue: Arc<lockfree::queue::Queue<usize>>,
     operations: usize,
 }
 
 impl Payload for LockfreeQueuePayload {
     fn new_pair() -> (Self, Self) {
+        let shared_queue = Arc::new(lockfree::queue::Queue::new());
         (
             Self {
-                queue: None,
+                queue: shared_queue.clone(),
                 operations: 10,
             },
             Self {
-                queue: None,
+                queue: shared_queue,
                 operations: 10,
             },
         )
     }
 
     fn prepare(&mut self) {
-        self.queue = Some(Arc::new(lockfree::queue::Queue::new()));
+        // Queue is already created and shared between workers
     }
 
     fn process(&mut self) {
-        let queue = self.queue.as_ref().expect("Queue should be initialized");
+        let queue = &self.queue;
         
         // Enqueue phase
         for i in 0..self.operations {
@@ -262,30 +227,31 @@ impl Payload for LockfreeQueuePayload {
 
 /// Payload for crossbeam SegQueue benchmarking
 struct CrossbeamSegQueuePayload {
-    queue: Option<Arc<crossbeam_queue::SegQueue<usize>>>,
+    queue: Arc<crossbeam_queue::SegQueue<usize>>,
     operations: usize,
 }
 
 impl Payload for CrossbeamSegQueuePayload {
     fn new_pair() -> (Self, Self) {
+        let shared_queue = Arc::new(crossbeam_queue::SegQueue::new());
         (
             Self {
-                queue: None,
+                queue: shared_queue.clone(),
                 operations: 10,
             },
             Self {
-                queue: None,
+                queue: shared_queue,
                 operations: 10,
             },
         )
     }
 
     fn prepare(&mut self) {
-        self.queue = Some(Arc::new(crossbeam_queue::SegQueue::new()));
+        // Queue is already created and shared between workers
     }
 
     fn process(&mut self) {
-        let queue = self.queue.as_ref().expect("Queue should be initialized");
+        let queue = &self.queue;
         
         // Enqueue phase
         for i in 0..self.operations {
@@ -301,30 +267,31 @@ impl Payload for CrossbeamSegQueuePayload {
 
 /// Payload for crossbeam ArrayQueue benchmarking
 struct CrossbeamArrayQueuePayload {
-    queue: Option<Arc<ArrayQueue<usize>>>,
+    queue: Arc<ArrayQueue<usize>>,
     operations: usize,
 }
 
 impl Payload for CrossbeamArrayQueuePayload {
     fn new_pair() -> (Self, Self) {
+        let shared_queue = Arc::new(ArrayQueue::new(32));
         (
             Self {
-                queue: None,
+                queue: shared_queue.clone(),
                 operations: 5, // Smaller for bounded array queue
             },
             Self {
-                queue: None,
+                queue: shared_queue,
                 operations: 5,
             },
         )
     }
 
     fn prepare(&mut self) {
-        self.queue = Some(Arc::new(ArrayQueue::new(32)));
+        // Queue is already created and shared between workers
     }
 
     fn process(&mut self) {
-        let queue = self.queue.as_ref().expect("Queue should be initialized");
+        let queue = &self.queue;
         
         // Enqueue phase
         for i in 0..self.operations {
@@ -343,48 +310,6 @@ impl Payload for CrossbeamArrayQueuePayload {
                 attempts += 1;
             }
         }
-    }
-}
-
-// Helper function to create different operation counts for different configurations
-impl AllocBoundedQueuePayload {
-    fn with_config(config: (usize, usize)) -> (Self, Self) {
-        let (_, ops) = config;
-        let scaled_ops = std::cmp::max(1, ops / 10); // Scale down operations
-        
-        (
-            Self {
-                queue: None,
-                operations: scaled_ops,
-                queue_size: 1024,
-            },
-            Self {
-                queue: None,
-                operations: scaled_ops,
-                queue_size: 1024,
-            },
-        )
-    }
-}
-
-// Similar helper implementations for other payload types
-impl UnboundedQueuePayload {
-    fn with_config(config: (usize, usize)) -> (Self, Self) {
-        let (_, ops) = config;
-        let scaled_ops = std::cmp::max(1, ops / 10);
-        
-        (
-            Self {
-                queue: None,
-                operations: scaled_ops,
-                segment_size: 1024,
-            },
-            Self {
-                queue: None,
-                operations: scaled_ops,
-                segment_size: 1024,
-            },
-        )
     }
 }
 

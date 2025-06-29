@@ -1,7 +1,7 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use crossbeam_queue::ArrayQueue;
 use lfqueue::{AllocBoundedQueue, ConstBoundedQueue, UnboundedQueue, const_queue};
-use many_cpus_benchmarking::{execute_runs, Payload, WorkDistribution};
+use many_cpus_benchmarking::{Payload, WorkDistribution, execute_runs};
 use std::collections::VecDeque;
 use std::hint::black_box;
 use std::sync::{Arc, Mutex};
@@ -33,7 +33,7 @@ impl Payload for AllocBoundedQueuePayload {
 
     fn process(&mut self) {
         let queue = &self.queue;
-        
+
         // Pattern from original: enqueue all items, then dequeue all items
         // Enqueue phase
         for i in 0..self.operations {
@@ -43,7 +43,7 @@ impl Payload for AllocBoundedQueuePayload {
                 attempts += 1;
             }
         }
-        
+
         // Dequeue phase
         for _ in 0..self.operations {
             let mut attempts = 0;
@@ -83,12 +83,12 @@ impl Payload for UnboundedQueuePayload {
     fn process(&mut self) {
         let queue = &self.queue;
         let mut full_handle = queue.full_handle();
-        
+
         // Pattern from original run_benchmark_lscq: enqueue all, then dequeue all
         for i in 0..self.operations {
             full_handle.enqueue(i);
         }
-        
+
         for _ in 0..self.operations {
             black_box(full_handle.dequeue());
         }
@@ -105,7 +105,7 @@ impl Payload for ConstBoundedQueuePayload {
     fn new_pair() -> (Self, Self) {
         #[allow(clippy::unused_unit)]
         let shared_queue = Arc::new(const_queue!(usize; 32));
-        
+
         (
             Self {
                 queue: shared_queue.clone(),
@@ -124,7 +124,7 @@ impl Payload for ConstBoundedQueuePayload {
 
     fn process(&mut self) {
         let queue = &self.queue;
-        
+
         // Enqueue phase
         for i in 0..self.operations {
             let mut attempts = 0;
@@ -133,7 +133,7 @@ impl Payload for ConstBoundedQueuePayload {
                 attempts += 1;
             }
         }
-        
+
         // Dequeue phase
         for _ in 0..self.operations {
             let mut attempts = 0;
@@ -172,13 +172,13 @@ impl Payload for MutexQueuePayload {
 
     fn process(&mut self) {
         let queue = &self.queue;
-        
+
         // Enqueue phase
         for i in 0..self.operations {
             queue.lock().unwrap().push_back(i);
         }
-        
-        // Dequeue phase  
+
+        // Dequeue phase
         for _ in 0..self.operations {
             black_box(queue.lock().unwrap().pop_front());
         }
@@ -212,12 +212,12 @@ impl Payload for LockfreeQueuePayload {
 
     fn process(&mut self) {
         let queue = &self.queue;
-        
+
         // Enqueue phase
         for i in 0..self.operations {
             queue.push(i);
         }
-        
+
         // Dequeue phase
         for _ in 0..self.operations {
             black_box(queue.pop());
@@ -252,12 +252,12 @@ impl Payload for CrossbeamSegQueuePayload {
 
     fn process(&mut self) {
         let queue = &self.queue;
-        
+
         // Enqueue phase
         for i in 0..self.operations {
             queue.push(i);
         }
-        
+
         // Dequeue phase
         for _ in 0..self.operations {
             black_box(queue.pop());
@@ -292,7 +292,7 @@ impl Payload for CrossbeamArrayQueuePayload {
 
     fn process(&mut self) {
         let queue = &self.queue;
-        
+
         // Enqueue phase
         for i in 0..self.operations {
             let mut attempts = 0;
@@ -301,7 +301,7 @@ impl Payload for CrossbeamArrayQueuePayload {
                 attempts += 1;
             }
         }
-        
+
         // Dequeue phase
         for _ in 0..self.operations {
             let mut attempts = 0;
@@ -317,93 +317,43 @@ impl Payload for CrossbeamArrayQueuePayload {
 
 /// Equivalent to bench_alloc_bounded_queue
 fn bench_alloc_bounded_queue_many_cpus(c: &mut Criterion) {
-    execute_runs::<AllocBoundedQueuePayload, 1>(
-        c,
-        WorkDistribution::all_with_unique_processors_without_self()
-    );
+    execute_runs::<AllocBoundedQueuePayload, 1>(c, WorkDistribution::all());
 }
 
 /// Equivalent to bench_lscq_queue (UnboundedQueue)
 fn bench_unbounded_queue_many_cpus(c: &mut Criterion) {
-    execute_runs::<UnboundedQueuePayload, 1>(
-        c,
-        WorkDistribution::all_with_unique_processors_without_self()
-    );
+    execute_runs::<UnboundedQueuePayload, 1>(c, WorkDistribution::all());
 }
 
 /// Equivalent to bench_const_bounded_queue
 fn bench_const_bounded_queue_many_cpus(c: &mut Criterion) {
-    execute_runs::<ConstBoundedQueuePayload, 1>(
-        c,
-        WorkDistribution::all_with_unique_processors_without_self()
-    );
+    execute_runs::<ConstBoundedQueuePayload, 1>(c, WorkDistribution::all());
 }
 
 /// Equivalent to bench_mutex_queue
 fn bench_mutex_queue_many_cpus(c: &mut Criterion) {
-    execute_runs::<MutexQueuePayload, 1>(
-        c,
-        WorkDistribution::all_with_unique_processors_without_self()
-    );
+    execute_runs::<MutexQueuePayload, 1>(c, WorkDistribution::all());
 }
 
 /// Equivalent to bench_lockfree_queue
 fn bench_lockfree_queue_many_cpus(c: &mut Criterion) {
-    execute_runs::<LockfreeQueuePayload, 1>(
-        c,
-        WorkDistribution::all_with_unique_processors_without_self()
-    );
+    execute_runs::<LockfreeQueuePayload, 1>(c, WorkDistribution::all());
 }
 
 /// Equivalent to bench_crossbeam_seg_queue
 fn bench_crossbeam_seg_queue_many_cpus(c: &mut Criterion) {
-    execute_runs::<CrossbeamSegQueuePayload, 1>(
-        c,
-        WorkDistribution::all_with_unique_processors_without_self()
-    );
+    execute_runs::<CrossbeamSegQueuePayload, 1>(c, WorkDistribution::all());
 }
 
 /// Equivalent to bench_crossbeam_array_queue
 fn bench_crossbeam_array_queue_many_cpus(c: &mut Criterion) {
-    execute_runs::<CrossbeamArrayQueuePayload, 1>(
-        c,
-        WorkDistribution::all_with_unique_processors_without_self()
-    );
-}
-
-/// Memory region focused benchmarks - tests the most important memory effects
-fn bench_memory_region_comparison(c: &mut Criterion) {
-    // Compare key memory region effects for the main queue types
-    execute_runs::<AllocBoundedQueuePayload, 1>(c, &[
-        WorkDistribution::PinnedMemoryRegionPairs,   // Cross-memory-region
-        WorkDistribution::PinnedSameMemoryRegion,    // Same memory region
-    ]);
-    
-    execute_runs::<UnboundedQueuePayload, 1>(c, &[
-        WorkDistribution::PinnedMemoryRegionPairs,
-        WorkDistribution::PinnedSameMemoryRegion,
-    ]);
-}
-
-/// High-throughput tests with payload multipliers
-fn bench_high_throughput_many_cpus(c: &mut Criterion) {
-    // Test with higher payload multipliers to reduce harness overhead
-    execute_runs::<AllocBoundedQueuePayload, 4>(
-        c,
-        &[WorkDistribution::PinnedMemoryRegionPairs]
-    );
-    
-    execute_runs::<UnboundedQueuePayload, 4>(
-        c,
-        &[WorkDistribution::PinnedMemoryRegionPairs]
-    );
+    execute_runs::<CrossbeamArrayQueuePayload, 1>(c, WorkDistribution::all());
 }
 
 criterion_group!(
     syncqueue_many_cpus_benchmarks,
     // Main queue benchmarks (equivalent to the active ones in original)
     bench_alloc_bounded_queue_many_cpus,
-    
     // All the commented-out benchmarks from original (now uncommented)
     bench_const_bounded_queue_many_cpus,
     bench_unbounded_queue_many_cpus,
@@ -411,10 +361,6 @@ criterion_group!(
     bench_lockfree_queue_many_cpus,
     bench_crossbeam_array_queue_many_cpus,
     bench_crossbeam_seg_queue_many_cpus,
-    
-    // Additional memory-region focused tests
-    bench_memory_region_comparison,
-    bench_high_throughput_many_cpus,
 );
 
 criterion_main!(syncqueue_many_cpus_benchmarks);

@@ -6,6 +6,9 @@ use std::collections::VecDeque;
 use std::hint::black_box;
 use std::sync::{Arc, Mutex};
 
+/// Number of operations each worker performs in the benchmark
+const OPERATIONS_PER_WORKER: usize = 100;
+
 /// Payload for AllocBoundedQueue benchmarking
 struct AllocBoundedQueuePayload {
     queue: Arc<AllocBoundedQueue<usize>>,
@@ -14,15 +17,16 @@ struct AllocBoundedQueuePayload {
 
 impl Payload for AllocBoundedQueuePayload {
     fn new_pair() -> (Self, Self) {
-        let shared_queue = Arc::new(AllocBoundedQueue::new(1024));
+        // Increase queue size to accommodate more operations from multiple workers
+        let shared_queue = Arc::new(AllocBoundedQueue::new(2048));
         (
             Self {
                 queue: shared_queue.clone(),
-                operations: 100, // Match original syncqueue.rs scale
+                operations: OPERATIONS_PER_WORKER,
             },
             Self {
                 queue: shared_queue,
-                operations: 100,
+                operations: OPERATIONS_PER_WORKER,
             },
         )
     }
@@ -58,11 +62,11 @@ impl Payload for UnboundedQueuePayload {
         (
             Self {
                 queue: shared_queue.clone(),
-                operations: 100,
+                operations: OPERATIONS_PER_WORKER,
             },
             Self {
                 queue: shared_queue,
-                operations: 100,
+                operations: OPERATIONS_PER_WORKER,
             },
         )
     }
@@ -88,23 +92,24 @@ impl Payload for UnboundedQueuePayload {
 
 /// Payload for ConstBoundedQueue benchmarking
 struct ConstBoundedQueuePayload {
-    queue: Arc<ConstBoundedQueue<usize, 64>>, // Using 64 to match const_queue!(usize; 32) -> 64 size
+    queue: Arc<ConstBoundedQueue<usize, 512>>, // Updated to match const_queue!(usize; 256) -> 512 size
     operations: usize,
 }
 
 impl Payload for ConstBoundedQueuePayload {
     fn new_pair() -> (Self, Self) {
         #[allow(clippy::unused_unit)]
-        let shared_queue = Arc::new(const_queue!(usize; 32));
-
+        // Increase const queue size to accommodate more operations
+        let shared_queue = Arc::new(const_queue!(usize; 256));
+        
         (
             Self {
                 queue: shared_queue.clone(),
-                operations: 32, // Match array queue size for const queue
+                operations: OPERATIONS_PER_WORKER,
             },
             Self {
                 queue: shared_queue,
-                operations: 32,
+                operations: OPERATIONS_PER_WORKER,
             },
         )
     }
@@ -139,11 +144,11 @@ impl Payload for MutexQueuePayload {
         (
             Self {
                 queue: shared_queue.clone(),
-                operations: 100,
+                operations: OPERATIONS_PER_WORKER,
             },
             Self {
                 queue: shared_queue,
-                operations: 100,
+                operations: OPERATIONS_PER_WORKER,
             },
         )
     }
@@ -179,11 +184,11 @@ impl Payload for LockfreeQueuePayload {
         (
             Self {
                 queue: shared_queue.clone(),
-                operations: 100,
+                operations: OPERATIONS_PER_WORKER,
             },
             Self {
                 queue: shared_queue,
-                operations: 100,
+                operations: OPERATIONS_PER_WORKER,
             },
         )
     }
@@ -219,11 +224,11 @@ impl Payload for CrossbeamSegQueuePayload {
         (
             Self {
                 queue: shared_queue.clone(),
-                operations: 100,
+                operations: OPERATIONS_PER_WORKER,
             },
             Self {
                 queue: shared_queue,
-                operations: 100,
+                operations: OPERATIONS_PER_WORKER,
             },
         )
     }
@@ -254,15 +259,16 @@ struct CrossbeamArrayQueuePayload {
 
 impl Payload for CrossbeamArrayQueuePayload {
     fn new_pair() -> (Self, Self) {
-        let shared_queue = Arc::new(ArrayQueue::new(32));
+        // Increase array queue size to accommodate more operations
+        let shared_queue = Arc::new(ArrayQueue::new(256));
         (
             Self {
                 queue: shared_queue.clone(),
-                operations: 32, // Match array queue size
+                operations: OPERATIONS_PER_WORKER,
             },
             Self {
                 queue: shared_queue,
-                operations: 32,
+                operations: OPERATIONS_PER_WORKER,
             },
         )
     }

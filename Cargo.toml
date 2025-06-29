@@ -17,9 +17,9 @@ arbitrary = { version = "1.4.1", features = ["derive"] }
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(fuzzing)'] }
 
 [features]
-default = [ "std" ]
-std = [ "haphazard" ]
-portable-atomic = [ "dep:portable-atomic" ]
+default = ["std"]
+std = ["haphazard"]
+portable-atomic = ["dep:portable-atomic"]
 
 [dependencies]
 crossbeam-utils = { version = "0.8.21", default-features = false }
@@ -31,10 +31,15 @@ arbitrary = { version = "1.4.1", features = ["derive"] }
 criterion = "0.6.0"
 crossbeam-queue = "0.3.12"
 lockfree = "0.5.1"
+many_cpus_benchmarking = "0.1"
 rand = "0.9.1"
 
 [[bench]]
 name = "syncqueue"
 harness = false
-required-features = ["std"] # this is the new property
+required-features = ["std"]
 
+[[bench]]
+name = "syncqueue_many_cpus"
+harness = false
+required-features = ["std"]

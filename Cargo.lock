@@ -428,9 +428,9 @@ dependencies = [
 
 [[package]]
 name = "many_cpus"
-version = "0.3.8"
+version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9449764c390da2db0a251a82c4834637dd51127c108e0016bcf4fc1baa2183ce"
+checksum = "682c64e29156f32d36d61251ba80e62265a465927e06e64ba1e11be8b9a3470b"
 dependencies = [
  "cpulist",
  "derive_more",
@@ -449,9 +449,9 @@ dependencies = [
 
 [[package]]
 name = "many_cpus_benchmarking"
-version = "0.1.17"
+version = "0.1.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1fe6628db6a085039ce36b80decd2c2b270ebe36d9b64f00291afe5c0f5df407"
+checksum = "397ad52b967a8908b34be27554e2c2cc8471af0c848e06878fc3fef0b00f820e"
 dependencies = [
  "cpulist",
  "criterion",

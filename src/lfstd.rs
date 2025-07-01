@@ -1,5 +1,5 @@
 use core::{
-    cell::UnsafeCell, fmt::Debug, marker::PhantomData, ptr::{null_mut, NonNull}
+    cell::UnsafeCell, fmt::Debug, marker::PhantomData, mem::MaybeUninit, ptr::{null_mut, NonNull}
 };
 
 use crossbeam_utils::CachePadded;
@@ -18,7 +18,7 @@ use crate::{
 
 /// The internal bounded queue type managed by an allocated buffer.
 pub(crate) type AllocBoundedQueueInternal<T, const MODE: usize> =
-    BoundedQueue<T, Box<[UnsafeCell<Option<T>>]>, Box<[CachePadded<AtomicUsize>]>, MODE>;
+    BoundedQueue<T, Box<[UnsafeCell<MaybeUninit<T>>]>, Box<[CachePadded<AtomicUsize>]>, MODE>;
 
 /// Allocates an array of [AtomicUsize] that is cache padded of size `n`. This
 /// is used for the initializaton methods for the [ScqRing].
@@ -83,7 +83,7 @@ fn allocate_atomic_array_empty(order: usize) -> ScqAlloc<Box<[CachePadded<Atomic
 pub type AllocBoundedQueue<T> = AllocBoundedQueueInternal<T, 0>;
 
 impl crate::scq::private::Sealed for Box<[CachePadded<AtomicUsize>]> {}
-impl<T> crate::scq::private::Sealed for Box<[UnsafeCell<Option<T>>]> {}
+impl<T> crate::scq::private::Sealed for Box<[UnsafeCell<MaybeUninit<T>>]> {}
 
 /// An SCQ ring backed by an allocation.
 type AllocScqRing<const MODE: bool> = ScqRing<Box<[CachePadded<AtomicUsize>]>, MODE>;
@@ -97,7 +97,7 @@ impl<T, const MODE: usize> AllocBoundedQueueInternal<T, MODE> {
             alloc_queue: ScqRing::new_alloc_ring_empty(order),
             free_queue: ScqRing::new_alloc_ring_full(order),
             backing: (0..(2 * size))
-                .map(|_| UnsafeCell::new(None))
+                .map(|_| UnsafeCell::new(MaybeUninit::uninit()))
                 .collect::<Box<_>>(),
             used: CachePadded::new(AtomicUsize::new(0)),
             _type: PhantomData,
@@ -149,6 +149,10 @@ impl<T> LscqNode<T> {
         }
     }
 }
+
+
+
+
 
 /// The [haphazard::AtomicPtr] type which facilitates using atomic pointers
 /// with hazard pointers for safe memory management.
@@ -931,6 +935,13 @@ mod tests {
         // Make a constant queue of size 8.
         let queue = const_queue!(usize; 8);
         assert!(queue.enqueue(8).is_ok());
+        assert_eq!(queue.dequeue(), Some(8));
+
+        use crate::SingleSize;
+
+        // Make a constant queue of size 8.
+        let queue = SingleSize::new();
+        assert!(queue.enqueue(8));
         assert_eq!(queue.dequeue(), Some(8));
     }
 

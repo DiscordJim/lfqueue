@@ -41,12 +41,15 @@ pub(crate) mod scq;
 
 pub(crate) mod atomics;
 
+mod single;
+
 #[cfg(feature = "std")]
 mod lfstd;
 
 pub use scq::BoundedQueue;
 pub use scq::ScqError;
 pub use scq::ConstBoundedQueue;
+pub use single::SingleSize;
 
 
 #[cfg(feature = "std")]

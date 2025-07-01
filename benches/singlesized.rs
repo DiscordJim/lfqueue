@@ -1,7 +1,7 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use crossbeam_queue::ArrayQueue;
 use lfqueue::{
-    AllocBoundedQueue, const_queue, ConstBoundedQueue,
+    const_queue, AllocBoundedQueue, ConstBoundedQueue, SingleSize
 };
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::Instant;
@@ -212,12 +212,28 @@ fn bench_crossbeam_array_queue(c: &mut Criterion) {
     );
 }
 
+fn benchmark_singleshot(c: &mut Criterion) {
+    configure_benchmark(
+        c,
+        "singleshot-array-queue",
+        PARAM_CONFIGS,
+        || Arc::new(SingleSize::new()),
+        |queue, item| {
+            let _ = queue.enqueue(item);
+        },
+        |queue| {
+            std::hint::black_box(queue.dequeue());
+        },
+    );
+}
+
+
 criterion_group!(
     queues,
+    benchmark_singleshot,
     bench_const_bounded_queue,
     bench_alloc_bounded_queue,
     bench_mutex_queue,
-    // bench_lockfree_queue,
     bench_crossbeam_array_queue,
 );
 criterion_main!(queues);

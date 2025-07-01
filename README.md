@@ -49,6 +49,17 @@ assert!(queue.enqueue(8).is_ok());
 assert_eq!(queue.dequeue(), Some(8));
 ```
 
+## SingleSize Queues
+This queue has a capacity of one, meaning that you can enqueue one message and dequeue one message. Logically, it is equivalent to `const_queue!(usize; 1)`.
+```rust
+use lfqueue::SingleSize;
+
+// Make a constant queue of size 8.
+let queue = SingleSize::new();
+assert!(queue.enqueue(8));
+assert_eq!(queue.dequeue(), Some(8));
+```
+
 # Benchmarks
 The queues within the library were tested against several other queues. The benchmarking is not exhaustive, but the process can be seen in `benches/syncqueue.rs`.
 
@@ -91,6 +102,10 @@ Testing with a queue size of 1.
 
 | crate| structure | test | time (ms) |
 | ---- | ---- | ---- | ---- |
+| lfqueue | `SingleSize` (1) | t=1,o=100 | 105.35µs |
+| lfqueue | `SingleSize` (1) | t=10,o=100 | 924.79µs |
+| lfqueue | `SingleSize` (1) | t=100,o=100 | 11.914ms |
+| lfqueue | `SingleSize` (1) | t=100,o=10000 | 37.5271ms |
 | lfqueue | `ConstBoundedQueue` (1) | t=1,o=100 | 133.09µs |
 | lfqueue | `ConstBoundedQueue` (1) | t=10,o=100 | 980.12 µs |
 | lfqueue | `ConstBoundedQueue` (1) | t=100,o=100 | 12.108ms |

@@ -111,7 +111,7 @@ fn configure_benchmark_raw<R, P, C>(
 {
     for (threads, ops) in patterns {
         c.bench_function(
-            &format!("{name} enqueue-dequeue | threads={threads}, ops={ops}"),
+            &format!("sync {name} enqueue-dequeue | threads={threads}, ops={ops}"),
             |b| {
                 b.iter_custom(move |iters| {
                     let context = routine();

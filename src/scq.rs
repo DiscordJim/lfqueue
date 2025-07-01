@@ -1,5 +1,5 @@
 use crate::atomics::{AtomicBool, AtomicIsize, AtomicUsize};
-use core::cell::UnsafeCell;
+use core::{cell::UnsafeCell, mem::MaybeUninit};
 use core::cmp;
 use core::fmt::Debug;
 use core::marker::PhantomData;
@@ -8,12 +8,12 @@ use crossbeam_utils::{Backoff, CachePadded};
 
 /// A constant generic [ScqRing] that does not use the heap to allocate
 /// itself.
-type ConstScqRing<const MODE: bool, const N: usize> = ScqRing<[CachePadded<AtomicUsize>; N], MODE>;
+type ConstScqRing<const MODE: usize, const N: usize> = ScqRing<[CachePadded<AtomicUsize>; N], MODE>;
 
 /// The cache padded atomic type used for ring arrays.
 type PaddedAtomics = [CachePadded<AtomicUsize>];
 
-impl<T, const N: usize> private::Sealed for [UnsafeCell<Option<T>>; N] {}
+impl<T, const N: usize> private::Sealed for [UnsafeCell<MaybeUninit<T>>; N] {}
 impl<const N: usize> private::Sealed for [CachePadded<AtomicUsize>; N] {}
 
 #[inline(always)]
@@ -460,7 +460,8 @@ pub(crate) fn yield_marker() {
 #[derive(Debug)]
 pub struct BoundedQueue<T, I, RING, const SEAL: usize>
 where 
-    I: private::Sealed
+    I: AsRef<[UnsafeCell<MaybeUninit<T>>]> + private::Sealed,
+    RING: AsRef<PaddedAtomics> + private::Sealed,
 {
     /// The backing array that keeps track of all the slots.
     pub(crate) backing: I,
@@ -474,8 +475,16 @@ where
     pub(crate) _type: PhantomData<T>,
 }
 
-unsafe impl<T: Send + Sync, I: private::Sealed, R, const SEAL: usize> Send for BoundedQueue<T, I, R, SEAL> {}
-unsafe impl<T: Send + Sync, I: private::Sealed, R, const SEAL: usize> Sync for BoundedQueue<T, I, R, SEAL> {}
+unsafe impl<T: Send + Sync, I: private::Sealed, R, const SEAL: usize> Send for BoundedQueue<T, I, R, SEAL>
+where 
+    I: AsRef<[UnsafeCell<MaybeUninit<T>>]> + private::Sealed,
+    R: AsRef<PaddedAtomics> + private::Sealed,
+{}
+unsafe impl<T: Send + Sync, I: private::Sealed, R, const SEAL: usize> Sync for BoundedQueue<T, I, R, SEAL>
+where 
+    I: AsRef<[UnsafeCell<MaybeUninit<T>>]> + private::Sealed,
+    R: AsRef<PaddedAtomics> + private::Sealed,
+{}
 
 /// A constant generic constant bounded queue, this implements the SCQ from the ACM paper,
 /// "A Scalable, Portable, and Memory-Efficient Lock-Free FIFO Queue" by Ruslan Nikolaev.
@@ -503,7 +512,7 @@ unsafe impl<T: Send + Sync, I: private::Sealed, R, const SEAL: usize> Sync for B
 /// assert_eq!(queue.enqueue(4), Err(ScqError::QueueFull));
 /// ```
 pub type ConstBoundedQueue<T, const N: usize> =
-    BoundedQueue<T, [UnsafeCell<Option<T>>; N], [CachePadded<AtomicUsize>; N], 0>;
+    BoundedQueue<T, [UnsafeCell<MaybeUninit<T>>; N], [CachePadded<AtomicUsize>; N], 0>;
 
 
 /// Creates a [ConstBoundedQueue]. This function exists mostly to creates
@@ -578,16 +587,18 @@ impl<T, const N: usize> ConstBoundedQueue<T, N> {
         Self {
             alloc_queue: ScqRing::new_const_ring_empty(),
             free_queue: ScqRing::new_const_ring_full(),
-            backing: core::array::from_fn(|_| UnsafeCell::new(None)),
+            backing: core::array::from_fn(|_| UnsafeCell::new(MaybeUninit::uninit())),
             used: CachePadded::new(AtomicUsize::new(0)),
             _type: PhantomData,
         }
     }
 }
 
+
+
 impl<T, I, P, const S: usize> BoundedQueue<T, I, P, S>
 where
-    I: AsRef<[UnsafeCell<Option<T>>]> + private::Sealed,
+    I: AsRef<[UnsafeCell<MaybeUninit<T>>]> + private::Sealed,
     P: AsRef<PaddedAtomics> + private::Sealed,
 {
     pub const MAX_ORDER: usize = 63;
@@ -605,7 +616,6 @@ where
     pub fn capacity(&self) -> usize {
         self.free_queue.capacity()
     }
-
     /// Enqueues an element to the bounded queue.
     ///
     /// # Example
@@ -634,7 +644,7 @@ where
     /// The index must be within bounds always. This will skip
     /// the bounds check in release mode.
     #[inline(always)]
-    unsafe fn index_ptr(&self, index: usize) -> *mut Option<T> {
+    unsafe fn index_ptr(&self, index: usize) -> *mut MaybeUninit<T> {
         let bref = self.backing.as_ref();
         debug_assert!((0..bref.len()).contains(&index), "Index is out of bounds.");
         // SAFETY: The caller safety contract requires the index to be valid.
@@ -659,7 +669,7 @@ where
         };
 
         // SAFETY: the ring only contains valid indices.
-        unsafe { *self.index_ptr(pos) = Some(item) };
+        unsafe { (*self.index_ptr(pos)).write(item); };
 
         if let Err(error) = self.alloc_queue.enqueue(pos) {
             debug_assert_eq!(
@@ -669,9 +679,9 @@ where
             );
 
             self.used.fetch_sub(1, AcqRel);
-            let item = unsafe { (*self.index_ptr(pos)).take() };
+            let item = unsafe { (*self.index_ptr(pos)).assume_init_read() };
             self.free_queue.enqueue(pos).unwrap();
-            return Err((item.unwrap(), error));
+            return Err((item, error));
         }
 
 
@@ -704,9 +714,7 @@ where
         self.used.fetch_sub(1, AcqRel);
 
         // Take the value out of the option
-        let Some(value) = (unsafe { (*self.index_ptr(pos)).take() }) else {
-            panic!("Failed to remove a value from the slot.");
-        };
+        let value = unsafe { (*self.index_ptr(pos)).assume_init_read() };
 
         // Enqueue error, this should never happen.
         if let Err(e) = self.free_queue.enqueue(pos) {
@@ -725,7 +733,19 @@ fn lfring_map(idx: usize, n: usize) -> usize {
 
 
 
+impl<T, I, P, const S: usize> Drop for BoundedQueue<T, I, P, S>
+where 
+    I: AsRef<[UnsafeCell<MaybeUninit<T>>]> + private::Sealed,
+    P: AsRef<PaddedAtomics> + private::Sealed,
+{
 
+    fn drop(&mut self) {
+        while let Some(inner) = self.alloc_queue.dequeue() {
+            // SAFETY: We have an exclusive reference to this memory.
+            unsafe { (*self.backing.as_ref()[inner].get()).assume_init_drop() }
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -965,4 +985,6 @@ mod tests {
         
 
     }
+
+
 }

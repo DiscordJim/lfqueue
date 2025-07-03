@@ -407,12 +407,10 @@ where
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub enum ScqError {
+pub(crate) enum ScqError {
     /// The items inserted will get corrupted if they are greater
     /// or equal to 2 ^ (order + 1).
     IndexLargerThanOrder,
-    /// The queue is completely filled.
-    QueueFull,
     /// The queue is finalized.
     QueueFinalized,
 }
@@ -422,10 +420,40 @@ impl core::fmt::Display for ScqError {
         f.write_str(match self {
             Self::IndexLargerThanOrder => "IndexLargerThanOrder",
             Self::QueueFinalized => "QueueFinalized",
-            Self::QueueFull => "QueueFull"
         })
     }
 }
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum QueueError {
+    QueueFull,
+    QueueFinalized
+}
+
+impl core::fmt::Display for QueueError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::QueueFull => "QueueFull",
+            Self::QueueFinalized => "QueueFinalized",
+        })
+    }
+}
+
+impl core::error::Error for QueueError {
+    fn cause(&self) -> Option<&dyn core::error::Error> {
+        None
+    }
+    fn description(&self) -> &str {
+        match self {
+            Self::QueueFull => "The queue is full of elements.",
+            Self::QueueFinalized => "The queue was finalized and no more elements may be inserted."
+        }
+    }
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        None
+    }
+}
+
 
 impl core::error::Error for ScqError {
     fn cause(&self) -> Option<&dyn core::error::Error> {
@@ -435,7 +463,6 @@ impl core::error::Error for ScqError {
         match self {
             Self::IndexLargerThanOrder => "The entry provided was greater or equal than 2 ^ order.",
             Self::QueueFinalized => "Attempted to insert an entry but the queue was finalized.",
-            Self::QueueFull => "The queue is full of elements."
         }
     }
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
@@ -501,7 +528,7 @@ where
 /// 
 /// # Manual Example
 /// ```
-/// use lfqueue::{ConstBoundedQueue, ScqError};
+/// use lfqueue::{ConstBoundedQueue, QueueError};
 ///
 /// // Make a queue of size 4.
 /// let queue = ConstBoundedQueue::<usize, 4>::new_const();
@@ -509,7 +536,7 @@ where
 /// assert_eq!(queue.capacity(), 2);
 /// assert!(queue.enqueue(2).is_ok());
 /// assert!(queue.enqueue(3).is_ok());
-/// assert_eq!(queue.enqueue(4), Err(ScqError::QueueFull));
+/// assert_eq!(queue.enqueue(4), Err(4));
 /// ```
 pub type ConstBoundedQueue<T, const N: usize> =
     BoundedQueue<T, [UnsafeCell<MaybeUninit<T>>; N], [CachePadded<AtomicUsize>; N], 0>;
@@ -527,12 +554,12 @@ pub type ConstBoundedQueue<T, const N: usize> =
 /// 
 /// # Example
 /// ```
-/// use lfqueue::{const_queue, ConstBoundedQueue, ScqError};
+/// use lfqueue::{const_queue, ConstBoundedQueue, QueueError};
 /// 
 /// // Let us create a constant queue of size 1.
 /// let queue = const_queue!(usize; 1);
 /// assert!(queue.enqueue(1).is_ok());
-/// assert_eq!(queue.enqueue(2), Err(ScqError::QueueFull));
+/// assert_eq!(queue.enqueue(2), Err(2));
 /// 
 /// // Let us create a constant queue of size 8;
 /// let queue = const_queue!(usize; 8);
@@ -569,12 +596,12 @@ impl<T, const N: usize> ConstBoundedQueue<T, N> {
     ///
     /// # Example
     /// ```
-    /// use lfqueue::{ConstBoundedQueue, ScqError};
+    /// use lfqueue::{ConstBoundedQueue, QueueError};
     ///
     /// let queue = ConstBoundedQueue::<usize, 4>::new_const();
     /// assert!(queue.enqueue(2).is_ok());
     /// assert!(queue.enqueue(3).is_ok());
-    /// assert_eq!(queue.enqueue(4), Err(ScqError::QueueFull));
+    /// assert_eq!(queue.enqueue(4), Err(4));
     /// ```
     pub fn new_const() -> Self {
         if const { N } % 2 != 0 {
@@ -626,7 +653,7 @@ where
     /// assert_eq!(queue.enqueue(4), Ok(()));
     /// assert_eq!(queue.dequeue(), Some(4));
     /// ```
-    pub fn enqueue(&self, item: T) -> Result<(), ScqError> {
+    pub fn enqueue(&self, item: T) -> Result<(), T> {
         // We want to make a call to the internal method here
         // without finalizing. If someone is calling the method
         // with [BounedQueue::enqueue] then it is not part of an unbounded
@@ -635,7 +662,7 @@ where
         // The idea is to make this into the public method, as a developer
         // using the crate should never have to make the decision whether
         // to enqueue with finalization or not.
-        self.enqueue_cycle::<false>(item).map_err(|(_, b)| b)
+        self.enqueue_cycle::<false>(item).map_err(|(a, _)| a)
     }
 
     /// Indexes a raw pointer to an index.
@@ -654,18 +681,18 @@ where
     /// The internal enqueue function. This prevents cloning by returning the original
     ///
     #[inline(always)]
-    pub(crate) fn enqueue_cycle<const FINALIZE: bool>(&self, item: T) -> Result<(), (T, ScqError)> {
+    pub(crate) fn enqueue_cycle<const FINALIZE: bool>(&self, item: T) -> Result<(), (T, QueueError)> {
         // Check if we may add an item to the queue.
         let size = self.used.fetch_add(1, AcqRel);
         if size >= self.free_queue.capacity() {
             self.used.fetch_sub(1, AcqRel);
-            return Err((item, ScqError::QueueFull));
+            return Err((item, QueueError::QueueFull));
         }
 
         // Check if we may dequeue an item.
         let Some(pos) = self.free_queue.dequeue() else {
             self.used.fetch_sub(1, AcqRel);
-            return Err((item, ScqError::QueueFull));
+            return Err((item, QueueError::QueueFull));
         };
 
         // SAFETY: the ring only contains valid indices.
@@ -681,7 +708,7 @@ where
             self.used.fetch_sub(1, AcqRel);
             let item = unsafe { (*self.index_ptr(pos)).assume_init_read() };
             self.free_queue.enqueue(pos).unwrap();
-            return Err((item, error));
+            return Err((item, QueueError::QueueFinalized));
         }
 
 
@@ -751,7 +778,7 @@ where
 mod tests {
     // use std::marker::PhantomData;
 
-    use crate::scq::{ScqError, lfring_signed_cmp};
+    use crate::scq::lfring_signed_cmp;
 
     #[cfg(loom)]
     #[test]
@@ -895,12 +922,12 @@ mod tests {
     #[test]
     #[cfg(not(loom))]
     pub fn test_const_queue() {
-        use crate::ConstBoundedQueue;
+        use crate::{ConstBoundedQueue};
 
         let queue = ConstBoundedQueue::<usize, 4>::new_const();
         assert!(queue.enqueue(1).is_ok());
         assert!(queue.enqueue(2).is_ok());
-        assert_eq!(queue.enqueue(3), Err(ScqError::QueueFull));
+        assert_eq!(queue.enqueue(3), Err(3));
     }
 
     #[cfg(not(loom))]
@@ -937,7 +964,8 @@ mod tests {
                 assert!(queue.enqueue(i).is_ok());
             }
             for i in 0..(N >> 1) {
-                assert_eq!(queue.enqueue(i), Err(ScqError::QueueFull));
+
+                assert_eq!(queue.enqueue(i), Err(i));
             }
             for i in 0..(N >> 1) {
                 assert_eq!(queue.dequeue(), Some(i));
@@ -966,7 +994,7 @@ mod tests {
     #[cfg(not(loom))]
     #[test]
     pub fn test_zst_const() {
-        use crate::ConstBoundedQueue;
+        use crate::{ConstBoundedQueue};
 
 
         let queue = const_queue!((); 4);
@@ -974,7 +1002,7 @@ mod tests {
         for _ in 0..queue.capacity() {
             assert!(queue.enqueue(()).is_ok());
         }
-        assert_eq!(queue.enqueue(()), Err(ScqError::QueueFull));
+        assert_eq!(queue.enqueue(()), Err(()));
 
         for _ in 0..queue.capacity() {
             assert_eq!(queue.dequeue(), Some(()));

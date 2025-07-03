@@ -16,7 +16,7 @@ const READING: u8 = 0x03;
 /// use lfqueue::SingleSize;
 /// 
 /// let queue = SingleSize::new();
-/// assert!(queue.enqueue(0));
+/// assert!(queue.enqueue(0).is_ok());
 /// assert_eq!(queue.dequeue(), Some(0));
 /// 
 /// ```
@@ -43,14 +43,14 @@ impl<T> SingleSize<T> {
         }
     }
     /// Enqueues a message.
-    pub fn enqueue(&self, message: T) -> bool {
+    pub fn enqueue(&self, message: T) -> Result<(), T> {
         if self.state.compare_exchange(EMPTY, WRITING, Relaxed, Relaxed).is_err() {
-            return false;
+            return Err(message);
         }
         // SAFETY: Only one thread can get access here.
         unsafe { (*self.payload.get()).write(message) };
         self.state.store(READY, Release);
-        true
+        Ok(())
     }
     /// Dequeues a message.
     pub fn dequeue(&self) -> Option<T> {
@@ -84,12 +84,12 @@ mod tests {
     #[test]
     pub fn test_singlesize() {
         let value = SingleSize::<usize>::new();
-        assert!(value.enqueue(1));
-        assert!(!value.enqueue(1));
+        assert!(value.enqueue(1).is_ok());
+        assert!(!value.enqueue(1).is_ok());
         assert_eq!(value.dequeue(), Some(1));
         assert_eq!(value.dequeue(), None);
 
-        assert!(value.enqueue(2));
+        assert!(value.enqueue(2).is_ok());
         assert_eq!(value.dequeue(), Some(2));
     }
 }

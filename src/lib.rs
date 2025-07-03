@@ -47,9 +47,9 @@ mod single;
 mod lfstd;
 
 pub use scq::BoundedQueue;
-pub use scq::ScqError;
 pub use scq::ConstBoundedQueue;
 pub use single::SingleSize;
+pub use scq::QueueError;
 
 
 #[cfg(feature = "std")]
@@ -78,7 +78,6 @@ mod fuzzing {
 
     use arbitrary::{Arbitrary, *};
 
-    use crate::ScqError;
 
 
     #[derive(Arbitrary, Debug, Clone)]
@@ -106,10 +105,10 @@ mod fuzzing {
                 size
             }
         }
-        pub fn enqueue(&self, value: T) -> Result<(), ScqError> {
+        pub fn enqueue(&self, value: T) -> Result<(), T> {
             let mut handle = self.queue.lock().unwrap();
             if handle.len() >= self.size {
-                return Err(ScqError::QueueFull);
+                return Err(value);
             }
             handle.push_back(value);
             Ok(())

@@ -1,7 +1,7 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use crossbeam_queue::ArrayQueue;
 use lfqueue::{
-    AllocBoundedQueue, ConstBoundedQueue, UnboundedEnqueueHandle, UnboundedQueue, const_queue,
+    AllocBoundedQueue, UnboundedQueue, const_queue, ConstBoundedQueue
 };
 use std::collections::VecDeque;
 use std::sync::{Arc, Barrier, Mutex};
@@ -137,7 +137,7 @@ fn configure_benchmark<R, C>(
     c: &mut Criterion,
     name: &str,
     patterns: &[(usize, usize)],
-    mut routine: R,
+    routine: R,
     enqueue: fn(&C, usize),
     dequeue: fn(&C),
 ) where

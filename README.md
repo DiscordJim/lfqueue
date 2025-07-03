@@ -56,7 +56,7 @@ use lfqueue::SingleSize;
 
 // Make a constant queue of size 8.
 let queue = SingleSize::new();
-assert!(queue.enqueue(8));
+assert!(queue.enqueue(8).is_ok());
 assert_eq!(queue.dequeue(), Some(8));
 ```
 

@@ -228,6 +228,7 @@ impl<T: Send + Sync> UnboundedQueueInternal<T> {
             let ncq = LscqNode::new(self.internal_order);
             ncq.value
                 .enqueue(element)
+                .map_err(|_| ())
                 .expect("Freshly allocated queue could not accept one value.");
 
             // SAFETY: `ncq` is allocated by box, thus the pointer is not null.
@@ -638,18 +639,18 @@ where
 mod tests {
     use crate::AllocBoundedQueue;
     #[cfg(not(loom))]
-    use crate::ScqError;
+    use crate::QueueError;
 
     #[test]
     #[cfg(not(loom))]
     pub fn check_scq_fill() {
-        use crate::{AllocBoundedQueue, ScqError};
+        use crate::AllocBoundedQueue;
 
-        let mut fill = AllocBoundedQueue::new(8);
+        let fill = AllocBoundedQueue::new(8);
         for i in 0..8 {
             fill.enqueue(i).unwrap();
         }
-        assert_eq!(fill.enqueue(0), Err(ScqError::QueueFull));
+        assert_eq!(fill.enqueue(0), Err(0));
     }
 
     #[cfg(not(loom))]
@@ -765,10 +766,10 @@ mod tests {
 
     #[cfg(not(loom))]
     #[test]
-    pub fn scqqueue_enq_deq() -> Result<(), ScqError> {
+    pub fn scqqueue_enq_deq() -> Result<(), QueueError> {
         let holder = AllocBoundedQueue::new(8);
-        holder.enqueue("A")?;
-        holder.enqueue("B")?;
+        holder.enqueue("A").unwrap();
+        holder.enqueue("B").unwrap();
 
         assert_eq!(holder.dequeue(), Some("A"));
         assert_eq!(holder.dequeue(), Some("B"));
@@ -791,7 +792,7 @@ mod tests {
             holder.enqueue("A").unwrap();
         }
 
-        assert_eq!(holder.enqueue("I"), Err(ScqError::QueueFull));
+        assert_eq!(holder.enqueue("I"), Err("I"));
         // holder.enqueue("J").unwrap();
         // holder.enqueue("K").unwrap();
         // holder.enqueue("L").unwrap();
@@ -829,7 +830,7 @@ mod tests {
 
         use crate::lfstd::ScqRing;
 
-        let mut ring = ScqRing::<_, 0>::new_alloc_ring_empty(3);
+        let ring = ScqRing::<_, 0>::new_alloc_ring_empty(3);
         for i in 0..ring.capacity() {
             ring.enqueue(i).unwrap();
         }
@@ -840,7 +841,7 @@ mod tests {
 
         // println!("Value: {:?}", auto.dequeue());
 
-        let mut auto = ScqRing::new_alloc_ring_full(3);
+        let auto = ScqRing::new_alloc_ring_full(3);
 
         assert_eq!(ring, auto);
 
@@ -892,7 +893,7 @@ mod tests {
                 assert!(queue.enqueue(i).is_ok());
             }
             for i in 0..(size) {
-                assert_eq!(queue.enqueue(i), Err(ScqError::QueueFull));
+                assert_eq!(queue.enqueue(i), Err(i));
             }
             for i in 0..(size) {
                 assert_eq!(queue.dequeue(), Some(i));
@@ -941,14 +942,13 @@ mod tests {
 
         // Make a constant queue of size 8.
         let queue = SingleSize::new();
-        assert!(queue.enqueue(8));
+        assert!(queue.enqueue(8).is_ok());
         assert_eq!(queue.dequeue(), Some(8));
     }
 
     #[cfg(not(loom))]
     #[test]
     pub fn test_zst_alloc() {
-        use crate::ConstBoundedQueue;
 
 
         let queue = AllocBoundedQueue::new(4);
@@ -956,7 +956,7 @@ mod tests {
         for _ in 0..queue.capacity() {
             assert!(queue.enqueue(()).is_ok());
         }
-        assert_eq!(queue.enqueue(()), Err(ScqError::QueueFull));
+        assert_eq!(queue.enqueue(()), Err(()));
 
         for _ in 0..queue.capacity() {
             assert_eq!(queue.dequeue(), Some(()));

@@ -17,15 +17,7 @@ A lock-free queue for asynchronous &amp; synchronous code from the ACM paper, _"
 # Quickstart
 The following section will give quickstart code examples. One limitation of the library is that sizes must be powers of two, therefore, only 1, 2, 4, 8, 16, ... are supported as lengths.
 
-[[bench]]
-name = "syncqueue_many_cpus"
-harness = false
-required-features = ["std"]
 
-[[bench]]
-name = "singlesized"
-harness = false
-required-features = ["std"]
 ## Allocated Queues
 Usually what you want is an allocated queue, which means that the values are all on the heap. There are two types: `AllocBoundedQueue`, which is the bounded queue but heap-allocated, and the `UnboundedQueue` which is _always_ heap allocated.
 ```rust

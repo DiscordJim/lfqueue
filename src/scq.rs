@@ -280,7 +280,7 @@ where
 
                     // Try to insert the entry.
                     if self.array.as_ref()[tidx]
-                        .compare_exchange_weak(entry, tcycle ^ eidx, AcqRel, Acquire)
+                        .compare_exchange_weak(entry, tcycle ^ eidx, AcqRel, Relaxed)
                         .is_err()
                     {
                         yield_marker();
@@ -291,8 +291,8 @@ where
                     // Update the threshold.
                     // FUTURE: Does this need SeqCst ordering?
                     let threshold = lfring_threshold3(half, n) as isize;
-                    if self.threshold.load(SeqCst) != threshold {
-                        self.threshold.store(threshold, SeqCst);
+                    if self.threshold.load(Acquire) != threshold {
+                        self.threshold.store(threshold, Release);
                     }
 
                     return Ok(());
@@ -313,7 +313,7 @@ where
     fn catchup(&self, mut tail: usize, mut head: usize) {
         while self
             .tail
-            .compare_exchange_weak(tail, head, AcqRel, Acquire)
+            .compare_exchange_weak(tail, head, AcqRel, Relaxed)
             .is_err()
         {
             head = self.head.load(Acquire);
@@ -329,7 +329,7 @@ where
 
         // Check the threshold and if we are empty, if we
         // are less than zero then it must be zero.
-        if self.threshold.load(SeqCst) < 0 {
+        if self.threshold.load(Acquire) < 0 {
             return None;
         }
 
@@ -375,7 +375,7 @@ where
                     // Try to swap out the entry.
                     if !(lfring_signed_cmp(ecycle, hcycle).is_lt()
                         && self.array.as_ref()[hidx]
-                            .compare_exchange_weak(entry, entry_new, AcqRel, Acquire)
+                            .compare_exchange_weak(entry, entry_new, AcqRel, Relaxed)
                             .is_err())
                     {
                         break;
@@ -484,6 +484,21 @@ pub(crate) fn yield_marker() {
 /// The bounded queue type from the ACM paper. This uses
 /// two SCQ rings internally, one that keeps track of free indices
 /// and the other that keeps track of the allocated indices.
+/// 
+/// This type is not meant to be constructed directly, instead use
+/// the type aliases, [ConstBoundedQueue] and [AllocBoundedQueue](crate::lfstd::AllocBoundedQueue)
+/// to construct a queue. For those who wish to understand exactly how
+/// this works and the various type parameters, a description follows:
+/// 
+/// - `T` is the item to be stored in the queue.
+/// - `I` is the backing storage for the queue, this is what actually stores `T`. It is
+/// some type that references to `[UnsafeCell<MaybeUninit<T>>]`. This is sealed to prevent
+/// having to handle weird edge cases.
+/// - `RING` is the backing storage for the ring which references to an
+/// array of [AtomicUsize] that are padded. This is also sealed.
+/// - `SEAL` is probably the only parameter that is reasonably configurable. This
+/// indicates if the queue can be finalized (`1`) or if it is not finalizable (`0`).
+/// This causes certain compiler optimizations whereby certain instructions are eliminate.
 #[derive(Debug)]
 pub struct BoundedQueue<T, I, RING, const SEAL: usize>
 where 
@@ -528,7 +543,7 @@ where
 /// 
 /// # Manual Example
 /// ```
-/// use lfqueue::{ConstBoundedQueue, QueueError};
+/// use lfqueue::{ConstBoundedQueue};
 ///
 /// // Make a queue of size 4.
 /// let queue = ConstBoundedQueue::<usize, 4>::new_const();
@@ -554,7 +569,7 @@ pub type ConstBoundedQueue<T, const N: usize> =
 /// 
 /// # Example
 /// ```
-/// use lfqueue::{const_queue, ConstBoundedQueue, QueueError};
+/// use lfqueue::{const_queue, ConstBoundedQueue};
 /// 
 /// // Let us create a constant queue of size 1.
 /// let queue = const_queue!(usize; 1);
@@ -596,7 +611,7 @@ impl<T, const N: usize> ConstBoundedQueue<T, N> {
     ///
     /// # Example
     /// ```
-    /// use lfqueue::{ConstBoundedQueue, QueueError};
+    /// use lfqueue::{ConstBoundedQueue};
     ///
     /// let queue = ConstBoundedQueue::<usize, 4>::new_const();
     /// assert!(queue.enqueue(2).is_ok());

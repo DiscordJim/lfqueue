@@ -17,6 +17,15 @@ A lock-free queue for asynchronous &amp; synchronous code from the ACM paper, _"
 # Quickstart
 The following section will give quickstart code examples. One limitation of the library is that sizes must be powers of two, therefore, only 1, 2, 4, 8, 16, ... are supported as lengths.
 
+[[bench]]
+name = "syncqueue_many_cpus"
+harness = false
+required-features = ["std"]
+
+[[bench]]
+name = "singlesized"
+harness = false
+required-features = ["std"]
 ## Allocated Queues
 Usually what you want is an allocated queue, which means that the values are all on the heap. There are two types: `AllocBoundedQueue`, which is the bounded queue but heap-allocated, and the `UnboundedQueue` which is _always_ heap allocated.
 ```rust
@@ -37,6 +46,7 @@ let queue = UnboundedQueue::new(8);
 queue.enqueue(0);
 assert_eq!(queue.dequeue(), Some(0));
 ```
+Additionally, if you must have the `len` method, there are `CountedUnboundedQueues` which introduce the method at a small performance penalty. They work the same as `UnboundedQueue`, except that as of now you cannot have handles to them.
 
 ## Constant Queues
 This queue is not backed by the heap and instead lives on the stack. These can be created manually, but we almost always want to use the macro which will set it up easily.
@@ -59,6 +69,7 @@ let queue = SingleSize::new();
 assert!(queue.enqueue(8).is_ok());
 assert_eq!(queue.dequeue(), Some(8));
 ```
+
 
 # Benchmarks
 The queues within the library were tested against several other queues. The benchmarking is not exhaustive, but the process can be seen in `benches/syncqueue.rs`.
@@ -105,7 +116,7 @@ Testing with a queue size of 1.
 | lfqueue | `SingleSize` (1) | t=1,o=100 | 105.35µs |
 | lfqueue | `SingleSize` (1) | t=10,o=100 | 924.79µs |
 | lfqueue | `SingleSize` (1) | t=100,o=100 | 11.914ms |
-| lfqueue | `SingleSize` (1) | t=100,o=10000 | 37.5271ms |
+| lfqueue | `SingleSize` (1) | t=100,o=10000 | 13.093ms |
 | lfqueue | `ConstBoundedQueue` (1) | t=1,o=100 | 133.09µs |
 | lfqueue | `ConstBoundedQueue` (1) | t=10,o=100 | 980.12 µs |
 | lfqueue | `ConstBoundedQueue` (1) | t=100,o=100 | 12.108ms |

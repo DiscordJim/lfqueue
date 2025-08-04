@@ -49,8 +49,6 @@ mod lfstd;
 pub use scq::BoundedQueue;
 pub use scq::ConstBoundedQueue;
 pub use single::SingleSize;
-pub use scq::QueueError;
-
 
 #[cfg(feature = "std")]
 pub use lfstd::AllocBoundedQueue;
@@ -60,9 +58,8 @@ pub use lfstd::UnboundedQueue;
 pub use lfstd::UnboundedEnqueueHandle;
 #[cfg(feature = "std")]
 pub use lfstd::UnboundedFullHandle;
-
-
-
+#[cfg(feature = "std")]
+pub use lfstd::CountedUnboundedQueue;
 
 // #[cfg(test)]
 #[cfg(fuzzing)]

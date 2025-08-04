@@ -1,9 +1,14 @@
 use core::{
-    cell::UnsafeCell, fmt::Debug, marker::PhantomData, mem::MaybeUninit, ptr::{null_mut, NonNull}
+    cell::UnsafeCell,
+    fmt::Debug,
+    marker::PhantomData,
+    mem::MaybeUninit,
+    ptr::{NonNull, null_mut},
 };
 
 use crossbeam_utils::CachePadded;
 use haphazard::{Domain, HazardPointer, Singleton};
+
 
 use crate::atomics::*;
 use crate::{
@@ -13,8 +18,6 @@ use crate::{
         lfring_threshold3, yield_marker,
     },
 };
-
-
 
 /// The internal bounded queue type managed by an allocated buffer.
 pub(crate) type AllocBoundedQueueInternal<T, const MODE: usize> =
@@ -105,8 +108,6 @@ impl<T, const MODE: usize> AllocBoundedQueueInternal<T, MODE> {
     }
 }
 
-
-
 /// The internals of the LCSQ queue, holds the atomic pointers. These are from the `haphazard` crate by
 /// John Gjengset, which is a great way of implementing hazard pointers to address the ABA problem.
 ///
@@ -141,18 +142,12 @@ impl<T> LscqNode<T> {
         unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(Self::new(size)))) }
     }
     fn new(size: usize) -> Self {
-    
         Self {
-        
             next: unsafe { haphazard::AtomicPtr::new(std::ptr::null_mut()) },
             value: BoundedQueue::new(size),
         }
     }
 }
-
-
-
-
 
 /// The [haphazard::AtomicPtr] type which facilitates using atomic pointers
 /// with hazard pointers for safe memory management.
@@ -278,7 +273,12 @@ impl<T: Send + Sync> UnboundedQueueInternal<T> {
     }
     /// Removes an element from the queue returning an [Option]. If the queue
     /// is empty then the returned value will be [Option::None].
-    pub fn dequeue(&self, hp: &mut HazardPointer<'_, QueueDomain>, next: &mut HazardPointer<'_, QueueDomain>, domain: &Domain<QueueDomain>) -> Option<T> {
+    pub fn dequeue(
+        &self,
+        hp: &mut HazardPointer<'_, QueueDomain>,
+        next: &mut HazardPointer<'_, QueueDomain>,
+        domain: &Domain<QueueDomain>,
+    ) -> Option<T> {
         loop {
             // SAFETY: The head node will always be a non-null node.
             let cq_ptr = self.head.safe_load(hp).unwrap();
@@ -299,7 +299,7 @@ impl<T: Send + Sync> UnboundedQueueInternal<T> {
                 .value
                 .alloc_queue
                 .threshold
-                .store(3 * (1 << (cq_ptr.value.free_queue.order + 1)) - 1, SeqCst);
+                .store(3 * (1 << (cq_ptr.value.free_queue.order + 1)) - 1, Release);
 
             // Try dequeing again.
             if let Some(p) = cq_ptr.value.dequeue() {
@@ -365,10 +365,9 @@ impl<T> Drop for UnboundedQueueInternal<T> {
 /// handle.enqueue(3);
 /// ```
 pub struct UnboundedEnqueueHandle<'a, T> {
-    internal: &'a UnboundedQueueInternal<T>,
+    internal: &'a UnboundedQueue<T>,
     primary: HazardPointer<'a, QueueDomain>,
 }
-
 
 impl<'a, T> UnboundedEnqueueHandle<'a, T>
 where
@@ -385,7 +384,7 @@ where
     /// handle.enqueue(3);
     /// ```
     pub fn enqueue(&mut self, item: T) {
-        self.internal.enqueue(&mut self.primary, item);
+        self.internal.internal.enqueue(&mut self.primary, item);
     }
 }
 
@@ -408,7 +407,7 @@ where
 pub struct UnboundedFullHandle<'a, T> {
     enqueue: UnboundedEnqueueHandle<'a, T>,
     secondary: HazardPointer<'a, QueueDomain>,
-    domain: &'a Domain<QueueDomain>
+    domain: &'a Domain<QueueDomain>,
 }
 
 impl<'a, T> UnboundedFullHandle<'a, T>
@@ -426,9 +425,7 @@ where
     /// handle.enqueue(3);
     /// ```
     pub fn enqueue(&mut self, item: T) {
-        self.enqueue
-            .internal
-            .enqueue(&mut self.enqueue.primary, item);
+        self.enqueue.enqueue(item);
     }
     /// Enqueues an item on the underlying queue.
     ///
@@ -443,12 +440,13 @@ where
     /// assert_eq!(handle.dequeue(), Some(3));
     /// ```
     pub fn dequeue(&mut self) -> Option<T> {
-        self.enqueue
-            .internal
-            .dequeue(&mut self.enqueue.primary, &mut self.secondary,self.domain)
+        self.enqueue.internal.internal.dequeue(
+            &mut self.enqueue.primary,
+            &mut self.secondary,
+            self.domain,
+        )
     }
 }
-
 
 /// An unbounded lock-free queue. This is the LCSQ from the ACM paper,
 /// "A Scalable, Portable, and Memory-Efficient Lock-Free FIFO Queue" by Ruslan Nikolaev.
@@ -472,17 +470,16 @@ where
 pub struct UnboundedQueue<T> {
     internal: UnboundedQueueInternal<T>,
     size: usize,
-    domain: Domain<QueueDomain>
+    domain: Domain<QueueDomain>,
 }
-
 
 impl<T: Debug> core::fmt::Debug for UnboundedQueue<T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("UnboundedQueue")
-         .field("internal", &self.internal)
-         .field("size", &self.size)
-         .field("domain", &"Domain")
-         .finish()
+            .field("internal", &self.internal)
+            .field("size", &self.size)
+            .field("domain", &"Domain")
+            .finish()
     }
 }
 
@@ -494,6 +491,7 @@ unsafe impl Singleton for QueueDomain {}
 
 unsafe impl<T: Send + Sync> Send for UnboundedQueue<T> {}
 unsafe impl<T: Send + Sync> Sync for UnboundedQueue<T> {}
+
 
 impl<T> UnboundedQueue<T>
 where
@@ -510,7 +508,6 @@ where
     /// assert_eq!(queue.base_segment_capacity(), 32);
     /// ```
     pub fn new() -> Self {
-        
         Self::with_segment_size(32)
     }
     /// Creates a new [UnboundedQueue] with a particular segment size. The segment
@@ -529,11 +526,11 @@ where
         Self {
             internal: UnboundedQueueInternal::new(size),
             size,
-            domain
+            domain,
         }
     }
     /// Returns the base segment size of the unbounded queue.
-    /// 
+    ///
     /// # Examples
     /// ```
     /// use lfqueue::UnboundedQueue;
@@ -558,15 +555,15 @@ where
     /// ```
     pub fn enqueue_handle(&self) -> UnboundedEnqueueHandle<'_, T> {
         UnboundedEnqueueHandle {
-            internal: &self.internal,
-            primary: HazardPointer::new_in_domain(&self.domain)
+            internal: self,
+            primary: HazardPointer::new_in_domain(&self.domain),
         }
     }
     pub fn full_handle(&self) -> UnboundedFullHandle<'_, T> {
         UnboundedFullHandle {
             enqueue: self.enqueue_handle(),
             secondary: HazardPointer::new_in_domain(&self.domain),
-            domain: &self.domain
+            domain: &self.domain,
         }
     }
     /// Enqueues a single entry. Internally, this just creates an [UnboundedEnqueueHandle] and
@@ -602,6 +599,181 @@ where
     }
 }
 
+// struct ManagedQueueInner<T> {
+//     internal: UnboundedQueueInternal<T>,
+//     domain: &'static Domain<QueueDomain>,
+// }
+
+// pub struct ManagedUnboundedQueue<T> {
+//     queue: ManagedQueueInner<T>,
+//     primary: ThreadLocal<UnsafeCell<HazardPointer<'static, QueueDomain>>>,
+//     secondary: ThreadLocal<UnsafeCell<HazardPointer<'static, QueueDomain>>>,
+// }
+
+// impl<T> ManagedUnboundedQueue<T>
+// where
+//     T: Send + Sync,
+// {
+//     pub fn new() -> Self {
+//         Self::with_segment_size(32)
+//     }
+//     pub fn with_segment_size(seg: usize) -> Self {
+//         let queue = ManagedQueueInner {
+//             internal: UnboundedQueueInternal::new(seg),
+//             domain: Box::leak(Box::new(Domain::new(&QueueDomain))),
+//         };
+
+//         Self {
+//             queue: queue,
+//             primary: ThreadLocal::new(),
+//             secondary: ThreadLocal::new(),
+//         }
+//     }
+//     pub fn enqueue(&self, item: T) {
+//         let primary = unsafe {
+//             access_hp_mut(&self.primary, self.queue.domain)
+//         };
+       
+//         self.queue.internal.enqueue(primary, item);
+//     }
+//     pub fn dequeue(&self) -> Option<T> {
+//         let primary = unsafe {
+//             access_hp_mut(&self.primary, self.queue.domain)
+//         };
+//          let secondary = unsafe {
+//             access_hp_mut(&self.secondary, self.queue.domain)
+//         };
+//         self.queue.internal.dequeue(primary, secondary, self.queue.domain)
+//     }
+// }
+
+// #[inline(always)]
+// unsafe fn access_hp_mut<'a, 'b: 'a, T>(
+//     variable: &'a ThreadLocal<UnsafeCell<HazardPointer<'b, T>>>,
+//     domain: &'b Domain<T>,
+// ) -> &'a mut HazardPointer<'b, T>
+// where 
+//     T: Send + Sync
+// {
+//     unsafe { &mut *variable.get_or(|| UnsafeCell::new(HazardPointer::new_in_domain(domain))).get() }
+// }
+
+/// A variant of the [UnboundedQueue] that
+///
+pub struct CountedUnboundedQueue<T> {
+    queue: UnboundedQueue<T>,
+    length: CachePadded<AtomicUsize>,
+}
+
+impl<T> CountedUnboundedQueue<T>
+where
+    T: Send + Sync,
+{
+    /// Creates a new [CountedUnboundedQueue] with a default
+    /// segment size of 32.
+    ///
+    /// # Examples
+    /// ```
+    /// use lfqueue::CountedUnboundedQueue;
+    ///
+    /// let queue = CountedUnboundedQueue::<()>::new();
+    /// assert_eq!(queue.base_segment_capacity(), 32);
+    /// ```
+    pub fn new() -> Self {
+        Self::with_segment_size(32)
+    }
+    /// Returns the base segment size of the unbounded queue.
+    ///
+    /// # Examples
+    /// ```
+    /// use lfqueue::CountedUnboundedQueue;
+    ///
+    /// let queue = CountedUnboundedQueue::<()>::with_segment_size(4);
+    /// assert_eq!(queue.base_segment_capacity(), 4);
+    /// ```
+    pub fn base_segment_capacity(&self) -> usize {
+        self.queue.size
+    }
+    /// Creates a new [CountedUnboundedQueue] with a particular segment size. The segment
+    /// size determines the size of each of the internal bounded queues. This method exists
+    /// to allow developers to customize the internal sizes of the queues.
+    ///
+    /// # Examples
+    /// ```
+    /// use lfqueue::CountedUnboundedQueue;
+    ///
+    /// let queue = CountedUnboundedQueue::<()>::with_segment_size(4);
+    /// assert_eq!(queue.base_segment_capacity(), 4);
+    /// ```
+    pub fn with_segment_size(seg: usize) -> Self {
+        Self {
+            queue: UnboundedQueue::with_segment_size(seg),
+            length: CachePadded::default(),
+        }
+    }
+    /// Reports if the queue is empty.
+    ///
+    /// # Example
+    /// ```
+    /// use lfqueue::CountedUnboundedQueue;
+    ///
+    /// let queue = CountedUnboundedQueue::new();
+    /// assert!(queue.is_empty());
+    /// queue.enqueue(1);
+    /// assert!(!queue.is_empty());
+    /// ```
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// Reports the length of the queue.
+    ///
+    /// # Example
+    /// ```
+    /// use lfqueue::CountedUnboundedQueue;
+    ///
+    /// let queue = CountedUnboundedQueue::new();
+    /// queue.enqueue(1);
+    /// assert_eq!(queue.len(), 1);
+    /// ```
+    pub fn len(&self) -> usize {
+        self.length.load(Acquire)
+    }
+    /// Enqueues a single entry.
+    ///
+    /// # Example
+    /// ```
+    /// use lfqueue::CountedUnboundedQueue;
+    ///
+    /// let queue = CountedUnboundedQueue::<usize>::new();
+    /// queue.enqueue(4);
+    /// assert_eq!(queue.len(), 1);
+    /// ```
+    pub fn enqueue(&self, item: T) {
+        self.length.fetch_add(1, AcqRel);
+        self.queue.enqueue(item);
+    }
+    /// Dequeues a single entry.
+    ///
+    /// # Example
+    /// ```
+    /// use lfqueue::CountedUnboundedQueue;
+    ///
+    /// let queue = CountedUnboundedQueue::<usize>::new();
+    /// queue.enqueue(4);
+    /// assert_eq!(queue.len(), 1);
+    /// assert_eq!(queue.dequeue(), Some(4));
+    /// assert_eq!(queue.len(), 0);
+    /// ```
+    pub fn dequeue(&self) -> Option<T> {
+        if let Some(item) = self.queue.dequeue() {
+            self.length.fetch_sub(1, AcqRel);
+            Some(item)
+        } else {
+            None
+        }
+    }
+}
+
 /// Frees memory allocated by an [Box]. This uses manual ma
 ///
 /// # Safety
@@ -613,19 +785,17 @@ unsafe fn free_owned_alloc<T>(ptr: *mut T) {
     drop(unsafe { Box::from_raw(ptr) });
 }
 
-
-
 impl<T> Default for UnboundedQueue<T>
-where 
-    T: Send + Sync
+where
+    T: Send + Sync,
 {
     /// Initializes an unbounded queue with a default
     /// segment size.
-    /// 
+    ///
     /// # Example
     /// ```
     /// use lfqueue::UnboundedQueue;
-    /// 
+    ///
     /// let queue = UnboundedQueue::<usize>::default();
     /// queue.enqueue(0);
     /// assert_eq!(queue.dequeue(), Some(0));
@@ -638,8 +808,6 @@ where
 #[cfg(test)]
 mod tests {
     use crate::AllocBoundedQueue;
-    #[cfg(not(loom))]
-    use crate::QueueError;
 
     #[test]
     #[cfg(not(loom))]
@@ -766,7 +934,7 @@ mod tests {
 
     #[cfg(not(loom))]
     #[test]
-    pub fn scqqueue_enq_deq() -> Result<(), QueueError> {
+    pub fn scqqueue_enq_deq() {
         let holder = AllocBoundedQueue::new(8);
         holder.enqueue("A").unwrap();
         holder.enqueue("B").unwrap();
@@ -774,9 +942,7 @@ mod tests {
         assert_eq!(holder.dequeue(), Some("A"));
         assert_eq!(holder.dequeue(), Some("B"));
         assert_eq!(holder.dequeue(), None);
-        Ok(())
     }
-    
 
     #[cfg(not(loom))]
     #[test]
@@ -805,6 +971,39 @@ mod tests {
         // assert_eq!(holder.dequeue(), Some("wow"));
     }
 
+    // #[cfg(not(loom))]
+    // #[test]
+    // pub fn test_managed_queue() {
+    //     use crate::lfstd::ManagedUnboundedQueue;
+
+    //     let queue = ManagedUnboundedQueue::new();
+    //     queue.enqueue(3);
+    //     assert_eq!(queue.dequeue(), Some(3));
+    //     assert_eq!(queue.dequeue(), None);
+    // }
+
+    #[cfg(not(loom))]
+    #[test]
+    pub fn test_unbounded_queue_length() {
+        use crate::lfstd::CountedUnboundedQueue;
+
+        let queue = CountedUnboundedQueue::new();
+        assert!(queue.is_empty());
+        queue.enqueue(3);
+        assert_eq!(queue.len(), 1);
+
+        queue.enqueue(2);
+        assert_eq!(queue.len(), 2);
+
+        queue.dequeue();
+        assert_eq!(queue.len(), 1);
+
+        queue.dequeue();
+        assert_eq!(queue.len(), 0);
+
+        // assert_eq!(queue.le)
+    }
+
     #[cfg(not(loom))]
     #[test]
     pub fn test_lfring_basic() {
@@ -826,8 +1025,6 @@ mod tests {
     #[cfg(not(loom))]
     #[test]
     pub fn initialize_full_correctly() {
-        
-
         use crate::lfstd::ScqRing;
 
         let ring = ScqRing::<_, 0>::new_alloc_ring_empty(3);
@@ -918,20 +1115,17 @@ mod tests {
     #[test]
     pub fn alloc_cover_example() {
         // PURPOSE: verify the correctness of the example in the README.md.
-        use crate::{const_queue, AllocBoundedQueue, UnboundedQueue, ConstBoundedQueue};
+        use crate::{AllocBoundedQueue, ConstBoundedQueue, UnboundedQueue, const_queue};
 
         // Make an allocated queue of size 8.
         let queue = AllocBoundedQueue::new(8);
         assert!(queue.enqueue(0).is_ok()); // this should enqueue correctly.
         assert_eq!(queue.dequeue(), Some(0));
 
-
-
         // Make an unbounded queue of segment size 8.
         let queue = UnboundedQueue::with_segment_size(8);
         queue.enqueue(0);
         assert_eq!(queue.dequeue(), Some(0));
-
 
         // Make a constant queue of size 8.
         let queue = const_queue!(usize; 8);
@@ -949,8 +1143,6 @@ mod tests {
     #[cfg(not(loom))]
     #[test]
     pub fn test_zst_alloc() {
-
-
         let queue = AllocBoundedQueue::new(4);
         assert_eq!(queue.capacity(), 4);
         for _ in 0..queue.capacity() {
@@ -964,8 +1156,6 @@ mod tests {
         assert!(queue.dequeue().is_none());
 
         // assert!(queue.enqueue(()).is_ok());
-        
-
     }
 
     #[cfg(not(loom))]
@@ -973,11 +1163,9 @@ mod tests {
     pub fn test_zst_unbounded() {
         use crate::UnboundedQueue;
 
-
         let queue = UnboundedQueue::new();
         queue.enqueue(());
         assert_eq!(queue.dequeue(), Some(()));
         assert!(queue.dequeue().is_none());
-
     }
 }

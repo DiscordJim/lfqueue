@@ -1,7 +1,7 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use crossbeam_queue::ArrayQueue;
 use lfqueue::{
-    AllocBoundedQueue, UnboundedQueue, const_queue, ConstBoundedQueue
+    const_queue, AllocBoundedQueue, ConstBoundedQueue, UnboundedQueue
 };
 use std::collections::VecDeque;
 use std::sync::{Arc, Barrier, Mutex};
@@ -245,6 +245,8 @@ fn bench_lscq_queue(c: &mut Criterion) {
     //     );
     // }
 }
+
+
 fn bench_const_bounded_queue(c: &mut Criterion) {
     configure_benchmark(
         c,

@@ -44,6 +44,12 @@ impl<T> SingleSize<T> {
     }
     /// Enqueues a message.
     pub fn enqueue(&self, message: T) -> Result<(), T> {
+        // We do a relaxed load here as compare exchange will lock
+        // the cache line.
+        if self.state.load(Relaxed) != EMPTY {
+            // If the state is not empty, we cannot enqueue.
+            return Err(message);
+        }
         if self.state.compare_exchange(EMPTY, WRITING, Relaxed, Relaxed).is_err() {
             return Err(message);
         }
@@ -54,6 +60,12 @@ impl<T> SingleSize<T> {
     }
     /// Dequeues a message.
     pub fn dequeue(&self) -> Option<T> {
+
+        // We do a relaxed load here as compare exchange will lock
+        // the cache line.
+        if self.state.load(Relaxed) != READY {
+            return None;
+        }
         if self.state.compare_exchange(READY, READING, Acquire, Relaxed).is_err() {
             None
         } else {

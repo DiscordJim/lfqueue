@@ -6,8 +6,9 @@ use core::{
     ptr::{NonNull, null_mut},
 };
 
+use crossbeam_epoch::{Atomic, Collector, Owned, Shared};
 use crossbeam_utils::CachePadded;
-use haphazard::{Domain, HazardPointer, Singleton};
+use haphazard::{Domain, Singleton};
 
 
 use crate::atomics::*;
@@ -119,8 +120,8 @@ impl<T, const MODE: usize> AllocBoundedQueueInternal<T, MODE> {
 /// Hazard Pointers & ABA problem, https://karevongeijer.com/blog/lock-free-queue-in-rust/
 #[derive(Debug)]
 struct UnboundedQueueInternal<T> {
-    head: CachePadded<HazardAtomicPtr<LscqNode<T>>>,
-    tail: CachePadded<HazardAtomicPtr<LscqNode<T>>>,
+    head: CachePadded<Atomic<LscqNode<T>>>,
+    tail: CachePadded<Atomic<LscqNode<T>>>,
     internal_order: usize,
 }
 
@@ -130,7 +131,7 @@ struct UnboundedQueueInternal<T> {
 #[derive(Debug)]
 struct LscqNode<T> {
     value: AllocBoundedQueueInternal<T, 1>,
-    next: haphazard::AtomicPtr<LscqNode<T>, QueueDomain>,
+    next: Atomic<LscqNode<T>>,
 }
 
 impl<T> LscqNode<T> {
@@ -143,7 +144,7 @@ impl<T> LscqNode<T> {
     }
     fn new(size: usize) -> Self {
         Self {
-            next: unsafe { haphazard::AtomicPtr::new(std::ptr::null_mut()) },
+            next: unsafe { Atomic::null() },
             value: BoundedQueue::new(size),
         }
     }
@@ -163,12 +164,14 @@ pub fn check_null_align<T>() {
 impl<T: Send + Sync> UnboundedQueueInternal<T> {
     /// Creates a new [UnboundedQueueInternal] with a single internal ring.
     pub fn new(segment_size: usize) -> Self {
-        let queue = LscqNode::allocate(segment_size);
+        // let queue = LscqNode::allocate(segment_size);
 
         // Get the actual pointer to set the pointer.
-        let queue_ptr = queue.as_ptr();
+        // let queue_ptr = queue.as_ptr();
 
         check_null_align::<LscqNode<T>>();
+
+        let aptr = Atomic::new(LscqNode::new(segment_size));
         Self {
             // SAFETY: the `haphazard` crate specifies several
             // safety contracts that must be upheld:
@@ -176,29 +179,40 @@ impl<T: Send + Sync> UnboundedQueueInternal<T> {
             // was allocated through box.
             // 2. `queue_ptr` was allocated using the pointer type `LscqNode`.
             // 3. `queue_ptr` will only be dropped through [haphazard::Domain::retire_ptr].
-            head: unsafe { HazardAtomicPtr::new(queue_ptr) }.into(),
-            tail: unsafe { HazardAtomicPtr::new(queue_ptr) }.into(),
+            head: aptr.clone().into(),
+            tail: aptr.into(),
             internal_order: segment_size,
         }
     }
+    // pub fn is_empty(&self) -> bool {}
     /// Enqueues an element of type `T` into the queue.
-    pub fn enqueue(&self, hp: &mut HazardPointer<'_, QueueDomain>, mut element: T) {
+    pub fn enqueue(&self, mut element: T) {
+        
+        
         loop {
+            let guard = &crossbeam_epoch::pin();
+        
             // Load the tail. This will never be null so we can just
             // unwrap it here.
-            let cq_ptr = self.tail.safe_load(hp).unwrap();
+            let c_ptr = self.tail.load(Acquire, guard);
+            
+            let cq_ptr = unsafe {c_ptr.deref() };
 
+            
             // If the next pointer is not null then we want to keep
             // going next until we have found the end.
-            let next_ptr = cq_ptr.next.load_ptr();
+            let next_ptr = cq_ptr.next.load(Acquire, guard);
             if !next_ptr.is_null() {
                 // SAFETY: the next pointer was constructed through a [Box] allocation
                 // and thus all the same safety requirements as `haphazard::AtomicPtr::new` are
                 // satisfied.
                 unsafe {
-                    let _ = self.tail.compare_exchange_ptr(
-                        cq_ptr as *const LscqNode<T> as *mut LscqNode<T>,
+                    let _ = self.tail.compare_exchange(
+                        c_ptr,
                         next_ptr,
+                        AcqRel,
+                        Relaxed,
+                        guard
                     );
                 }
 
@@ -227,7 +241,8 @@ impl<T: Send + Sync> UnboundedQueueInternal<T> {
                 .expect("Freshly allocated queue could not accept one value.");
 
             // SAFETY: `ncq` is allocated by box, thus the pointer is not null.
-            let ncq = unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(ncq))) };
+            let ncq = Owned::new(ncq).into_shared(guard);
+            // let ncq = unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(ncq))) };
 
             // Try to insert a new tail into the queue.
             // SAFETY: the next pointer was constructed through a [Box] allocation
@@ -236,14 +251,17 @@ impl<T: Send + Sync> UnboundedQueueInternal<T> {
             if unsafe {
                 cq_ptr
                     .next
-                    .compare_exchange_ptr(null_mut(), ncq.as_ptr())
+                    .compare_exchange(Shared::null(), ncq, AcqRel, Relaxed, guard)
                     .is_ok()
             } {
                 // Correct the list ordering.
                 let _ = unsafe {
-                    self.tail.compare_exchange_ptr(
-                        cq_ptr as *const LscqNode<T> as *mut LscqNode<T>,
-                        ncq.as_ptr(),
+                    self.tail.compare_exchange(
+                        c_ptr,
+                        ncq,
+                        AcqRel,
+                        Relaxed,
+                        guard
                     )
                 };
                 // NOTE: We do not have to free the allocation here
@@ -255,18 +273,19 @@ impl<T: Send + Sync> UnboundedQueueInternal<T> {
             // can avoid clones.
             // SAFETY: This is the only instance of this pointer
             // and it is non-null because we allocated it with `Box`.
-            let Some(value) = (unsafe { ncq.as_ref().value.dequeue() }) else {
+            let Some(value) = (unsafe { ncq.deref().value.dequeue() }) else {
                 panic!("Failed to access previously enqueued value.")
             };
             element = value;
 
             // SAFETY: The allocation was created with `Box` and we
-            // have unique access to it. This is sound because it
+            // have unique access to it. Thiss is sound because it
             // is not part of any atomic pointer and thus we can
             // manually free it.
-            unsafe {
-                free_owned_alloc(ncq.as_ptr());
-            }
+            unsafe { guard.defer_destroy(ncq); }
+            // unsafe {
+            //     free_owned_alloc(ncq.as_ptr());
+            // }
 
             yield_marker();
         }
@@ -274,25 +293,35 @@ impl<T: Send + Sync> UnboundedQueueInternal<T> {
     /// Removes an element from the queue returning an [Option]. If the queue
     /// is empty then the returned value will be [Option::None].
     pub fn dequeue(
-        &self,
-        hp: &mut HazardPointer<'_, QueueDomain>,
-        next: &mut HazardPointer<'_, QueueDomain>,
-        domain: &Domain<QueueDomain>,
+        &self
     ) -> Option<T> {
+        
         loop {
+            let guard = &crossbeam_epoch::pin();
             // SAFETY: The head node will always be a non-null node.
-            let cq_ptr = self.head.safe_load(hp).unwrap();
+            // println!("hello...");
+            let c_ptr = self.head.load(Acquire, guard);
+            // println!("is null... {}", c_ptr.is_null());
+            let cq_ptr = unsafe { c_ptr.deref() };
+
+            // println!("john...");
 
             // Dequeue an entry.
             if let Some(p) = cq_ptr.value.dequeue() {
                 // The entry actually holds some value, so we just
                 // return it here.
+                // println!("Unloaded...");
                 return Some(p);
             }
 
             // If the next pointer is null then we have nothing
             // to dequeue and thus we can just return [Option::None].
-            let next_ptr = cq_ptr.next.safe_load(next)?;
+            let next_ptr = cq_ptr.next.load(Acquire, guard);
+            if next_ptr.is_null() {
+                return None;
+            }
+
+            // println!("Next: {}", next_ptr.is_null());
 
             // Update the threshold.
             cq_ptr
@@ -312,9 +341,12 @@ impl<T: Send + Sync> UnboundedQueueInternal<T> {
             // and thus all the same safety requirements as `haphazard::AtomicPtr::new` are
             // satisfied.
             if let Ok(mut ok) = unsafe {
-                self.head.compare_exchange_ptr(
-                    cq_ptr as *const LscqNode<T> as *mut LscqNode<T>,
-                    next_ptr as *const LscqNode<T> as *mut LscqNode<T>,
+                self.head.compare_exchange(
+                    c_ptr,
+                    next_ptr,
+                    AcqRel,
+                    Relaxed,
+                    guard
                 )
             } {
                 // SAFETY: The haphazard crate requires us to uphold two
@@ -324,7 +356,16 @@ impl<T: Send + Sync> UnboundedQueueInternal<T> {
                 // is not possible for it to be loaded again and thus we can retire it.
                 // 2. The pointed-to object has not been retired yet, by (1) we see
                 // that we were the ones to remove it from the list and thus arrive here.
-                unsafe { ok.take().unwrap().retire_in(&domain) };
+                
+                // println!("{}", c_ptr.as_raw().eq(&next_ptr.as_raw()));
+                // println!("deferall");
+                // guard.defer(|| {});
+                unsafe {
+                    guard.defer_destroy(c_ptr);
+                    // guard.flush();
+                
+                };
+                // unsafe { ok.deref_mut().take().unwrap().retire_in(&domain) };
             }
 
             yield_marker();
@@ -336,7 +377,8 @@ impl<T> Drop for UnboundedQueueInternal<T> {
     /// Drops the queue, deallocating all the nodes. Requires
     /// exclusive access to the queue.
     fn drop(&mut self) {
-        let mut next = self.head.load_ptr();
+        let guard = crossbeam_epoch::pin();
+        let mut next = self.head.load(Acquire, &guard);
         while !next.is_null() {
             // SAFETY: If drop is called then we have exclusive access
             // to this structure. All pointers were allocated by
@@ -344,10 +386,12 @@ impl<T> Drop for UnboundedQueueInternal<T> {
             // are not null.
             unsafe {
                 let temp = next;
-                next = (*next).next.load_ptr();
-                free_owned_alloc(temp);
+                next = (next.deref()).next.load(Acquire, &guard);
+                unsafe { guard.defer_destroy(temp); }
+                // free_owned_alloc(temp);
             }
         }
+        guard.flush();
     }
 }
 
@@ -366,7 +410,7 @@ impl<T> Drop for UnboundedQueueInternal<T> {
 /// ```
 pub struct UnboundedEnqueueHandle<'a, T> {
     internal: &'a UnboundedQueue<T>,
-    primary: HazardPointer<'a, QueueDomain>,
+    // primary: HazardPointer<'a, QueueDomain>,
 }
 
 impl<'a, T> UnboundedEnqueueHandle<'a, T>
@@ -384,7 +428,7 @@ where
     /// handle.enqueue(3);
     /// ```
     pub fn enqueue(&mut self, item: T) {
-        self.internal.internal.enqueue(&mut self.primary, item);
+        self.internal.internal.enqueue(item);
     }
 }
 
@@ -406,8 +450,8 @@ where
 /// ```
 pub struct UnboundedFullHandle<'a, T> {
     enqueue: UnboundedEnqueueHandle<'a, T>,
-    secondary: HazardPointer<'a, QueueDomain>,
-    domain: &'a Domain<QueueDomain>,
+    // secondary: HazardPointer<'a, QueueDomain>,
+    // domain: &'a Domain<QueueDomain>,
 }
 
 impl<'a, T> UnboundedFullHandle<'a, T>
@@ -441,9 +485,9 @@ where
     /// ```
     pub fn dequeue(&mut self) -> Option<T> {
         self.enqueue.internal.internal.dequeue(
-            &mut self.enqueue.primary,
-            &mut self.secondary,
-            self.domain,
+            // &mut self.enqueue.primary,
+            // &mut self.secondary,
+            // self.domain,
         )
     }
 }
@@ -471,6 +515,7 @@ pub struct UnboundedQueue<T> {
     internal: UnboundedQueueInternal<T>,
     size: usize,
     domain: Domain<QueueDomain>,
+    collector: Collector
 }
 
 impl<T: Debug> core::fmt::Debug for UnboundedQueue<T> {
@@ -527,6 +572,7 @@ where
             internal: UnboundedQueueInternal::new(size),
             size,
             domain,
+            collector: Collector::new()
         }
     }
     /// Returns the base segment size of the unbounded queue.
@@ -556,14 +602,14 @@ where
     pub fn enqueue_handle(&self) -> UnboundedEnqueueHandle<'_, T> {
         UnboundedEnqueueHandle {
             internal: self,
-            primary: HazardPointer::new_in_domain(&self.domain),
+            // primary: HazardPointer::new_in_domain(&self.domain),
         }
     }
     pub fn full_handle(&self) -> UnboundedFullHandle<'_, T> {
         UnboundedFullHandle {
             enqueue: self.enqueue_handle(),
-            secondary: HazardPointer::new_in_domain(&self.domain),
-            domain: &self.domain,
+            // secondary: HazardPointer::new_in_domain(&self.domain),
+            // domain: &self.domain,
         }
     }
     /// Enqueues a single entry. Internally, this just creates an [UnboundedEnqueueHandle] and
@@ -1156,6 +1202,17 @@ mod tests {
         assert!(queue.dequeue().is_none());
 
         // assert!(queue.enqueue(()).is_ok());
+    }
+
+    #[cfg(not(loom))]
+    #[test]
+    pub fn test_unbounded_is_empty() {
+        use crate::UnboundedQueue;
+
+
+        let unb = UnboundedQueue::<usize>::with_segment_size(4);
+        unb.enqueue(4);
+
     }
 
     #[cfg(not(loom))]

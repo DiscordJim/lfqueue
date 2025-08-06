@@ -382,6 +382,7 @@ version = "0.8.1"
 dependencies = [
  "arbitrary",
  "criterion",
+ "crossbeam-epoch",
  "crossbeam-queue",
  "crossbeam-utils",
  "haphazard",

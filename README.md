@@ -7,6 +7,17 @@
 
 </div>
 
+
+[[bench]]
+name = "syncqueue_many_cpus"
+harness = false
+required-features = ["std"]
+
+[[bench]]
+name = "singlesized"
+harness = false
+required-features = ["std"]
+
 A lock-free queue for asynchronous &amp; synchronous code from the ACM paper, _"A Scalable, Portable, and Memory-Efficient Lock-Free FIFO Queue"_ by Ruslan Nikolaev ([arXiV/1908.04511](https://arxiv.org/abs/1908.04511)). This implements the proposed SCQ (bounded) and LSCQ (unbounded) variant of the queue using atomics.
 
 # Features

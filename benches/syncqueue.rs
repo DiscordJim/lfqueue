@@ -38,11 +38,13 @@ fn run_benchmark_lscq(
                     // enqueue(&context, i);
                     // context.lock().unwrap().push_back(std::hint::black_box(i));
                 }
+                // crossbeam_epoch::pin().flush();
                 for _ in 0..ops {
                     std::hint::black_box(full.dequeue());
                     // dequeue(&context);
                     // context.lock().unwrap().pop_front();
                 }
+                // crossbeam_epoch::pin().flush();
                 // println!("Hitting the barrier...");
                 // barrier_finalized.wait();
                 // println!("Hit the barrier...");
@@ -294,12 +296,15 @@ fn bench_crossbeam_array_queue(c: &mut Criterion) {
 
 criterion_group!(
     queues,
+  
+    bench_lscq_queue,
+      bench_crossbeam_seg_queue,
     bench_const_bounded_queue,
     bench_alloc_bounded_queue,
-    bench_lscq_queue,
+    
     bench_mutex_queue,
     bench_lockfree_queue,
     bench_crossbeam_array_queue,
-    bench_crossbeam_seg_queue
+    
 );
 criterion_main!(queues);

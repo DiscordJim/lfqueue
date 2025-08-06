@@ -6,7 +6,8 @@ description = "Fast concurrent lock-free MPMC queues"
 license-file = "LICENSE"
 repository = "https://github.com/DiscordJim/lfqueue"
 
-
+[profile.release]
+debug = true
 [target.'cfg(loom)'.dependencies]
 loom = "0.7.2"
 
@@ -22,6 +23,7 @@ std = ["haphazard"]
 portable-atomic = ["dep:portable-atomic"]
 
 [dependencies]
+crossbeam-epoch = "0.9.18"
 crossbeam-utils = { version = "0.8.21", default-features = false }
 haphazard = { version = "0.1.8", optional = true }
 portable-atomic = { version = "1.11.1", optional = true }
@@ -36,15 +38,5 @@ rand = "0.9.1"
 
 [[bench]]
 name = "syncqueue"
-harness = false
-required-features = ["std"]
-
-[[bench]]
-name = "syncqueue_many_cpus"
-harness = false
-required-features = ["std"]
-
-[[bench]]
-name = "singlesized"
 harness = false
 required-features = ["std"]
